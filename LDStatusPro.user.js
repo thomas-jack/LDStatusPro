@@ -14,8 +14,8 @@
 // @connect      linux.do
 // @connect      github.com
 // @connect      raw.githubusercontent.com
-// @updateURL    https://raw.githubusercontent.com/1e0n/LinuxDoStatus/master/LDStatus.user.js
-// @downloadURL  https://raw.githubusercontent.com/1e0n/LinuxDoStatus/master/LDStatus.user.js
+// @updateURL    https://raw.githubusercontent.com/caigg188/LDStatusPro/main/LDStatusPro.user.js
+// @downloadURL  https://raw.githubusercontent.com/caigg188/LDStatusPro/main/LDStatusPro.user.js
 // ==/UserScript==
 
 (function() {
@@ -2176,7 +2176,7 @@
         }
 
         checkUpdate() {
-            const url = 'https://raw.githubusercontent.com/1e0n/LinuxDoStatus/master/LDStatus.user.js';
+            const url = 'https://raw.githubusercontent.com/caigg188/LDStatusPro/main/LDStatusPro.user.js';
             this.$.btnUpdate.textContent = '⏳';
 
             GM_xmlhttpRequest({
