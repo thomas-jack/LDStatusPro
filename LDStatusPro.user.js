@@ -1353,15 +1353,29 @@
             this._lastFailure[type] = 0;
         }
         
-        // 检查用户 trust_level 是否足够（缓存24小时）
+        // 检查用户 trust_level 是否足够
+        // 优先从 OAuth 用户信息获取，其次使用缓存
         _hasSufficientTrustLevel() {
+            // 1. 优先从 OAuth 用户信息获取 trust_level（最准确）
+            const userInfo = this.oauth.getUserInfo();
+            if (userInfo && typeof userInfo.trust_level === 'number') {
+                const hasTrust = userInfo.trust_level >= 2;
+                // 更新缓存以便其他地方使用
+                if (this._trustLevelCache !== hasTrust) {
+                    this._updateTrustLevelCache(hasTrust);
+                }
+                return hasTrust;
+            }
+            
+            // 2. 使用缓存（24小时有效）
             const now = Date.now();
             const cacheAge = now - this._trustLevelCacheTime;
-            // 缓存24小时有效
             if (this._trustLevelCache !== null && cacheAge < 24 * 60 * 60 * 1000) {
                 return this._trustLevelCache;
             }
-            return null; // 需要从API获取
+            
+            // 3. 无法确定，返回 null（需要从 API 获取）
+            return null;
         }
         
         // 更新 trust_level 缓存
@@ -1782,15 +1796,26 @@
 
         /**
          * 页面加载时同步升级要求数据
+         * 仅 trust_level >= 2 的用户可用
          */
         async syncRequirementsOnLoad() {
             if (!this.oauth.isLoggedIn() || !this._historyMgr) return;
             
-            // 检查 trust_level 缓存，如果已知不足直接跳过
-            const cachedTrust = this._hasSufficientTrustLevel();
-            if (cachedTrust === false) {
-                console.log('[CloudSync] Requirements sync skipped - cached trust_level < 2');
+            // 检查 trust_level，如果已知不足则直接跳过（不发起任何请求）
+            const hasTrust = this._hasSufficientTrustLevel();
+            if (hasTrust === false) {
+                console.log('[CloudSync] Requirements sync skipped - trust_level < 2');
                 return;
+            }
+            
+            // 如果无法确定 trust_level (hasTrust === null)，检查本地是否有数据
+            // 只有本地有升级要求数据时才尝试同步（避免低等级新用户发起无效请求）
+            if (hasTrust === null) {
+                const localHistory = this._historyMgr.getHistory();
+                if (!localHistory || localHistory.length === 0) {
+                    console.log('[CloudSync] Requirements sync skipped - no local data and trust_level unknown');
+                    return;
+                }
             }
 
             const now = Date.now();
