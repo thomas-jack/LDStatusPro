@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDStatus Pro
 // @namespace    http://tampermonkey.net/
-// @version      3.2.4
+// @version      3.2.6
 // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计。两站点均支持排行榜和云同步功能
 // @author       JackLiii
 // @license      MIT
@@ -630,7 +630,10 @@
                                 }
                                 resolve(data);
                             } else {
-                                reject(new Error(data.error?.message || data.error || `HTTP ${res.status}`));
+                                // 构建错误消息，包含错误码便于识别
+                                const errorCode = data.error?.code || '';
+                                const errorMsg = data.error?.message || data.error || `HTTP ${res.status}`;
+                                reject(new Error(`${errorCode}: ${errorMsg}`));
                             }
                         } catch (e) {
                             reject(new Error('Parse error'));
@@ -1073,7 +1076,46 @@
         getUserInfo() { return this.storage.getGlobal('leaderboardUser', null); }
         setUserInfo(user) { this.storage.setGlobalNow('leaderboardUser', user); }
         
-        isLoggedIn() { return !!(this.getToken() && this.getUserInfo()); }
+        /**
+         * 检查是否已登录且 Token 未过期
+         */
+        isLoggedIn() {
+            const token = this.getToken();
+            const user = this.getUserInfo();
+            if (!token || !user) return false;
+            
+            // 检查 token 是否过期
+            if (this._isTokenExpired(token)) {
+                console.log('[LDStatus Pro] Token expired, logging out');
+                this.logout();
+                return false;
+            }
+            return true;
+        }
+        
+        /**
+         * 解析 JWT Token 检查是否过期
+         */
+        _isTokenExpired(token) {
+            try {
+                const parts = token.split('.');
+                if (parts.length !== 3) return true;
+                
+                // 解析 payload (base64url)
+                const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+                const decoded = JSON.parse(atob(payload));
+                
+                // 检查过期时间 (exp 是秒级时间戳)
+                if (!decoded.exp) return false; // 无过期时间则认为有效
+                
+                const now = Math.floor(Date.now() / 1000);
+                // 提前 5 分钟判断为过期，避免请求时刚好过期
+                return decoded.exp < (now + 300);
+            } catch (e) {
+                console.error('[LDStatus Pro] Token parse error:', e);
+                return true; // 解析失败视为过期
+            }
+        }
         
         isJoined() { return this.storage.getGlobal('leaderboardJoined', false); }
         setJoined(v) { this.storage.setGlobalNow('leaderboardJoined', v); }
@@ -1153,8 +1195,25 @@
             this.setJoined(false);
         }
 
+        /**
+         * 发起 API 请求，自动处理 Token 过期
+         */
         async api(endpoint, options = {}) {
-            return this.network.api(endpoint, { ...options, token: this.getToken() });
+            try {
+                const result = await this.network.api(endpoint, { ...options, token: this.getToken() });
+                return result;
+            } catch (e) {
+                // 检查是否是 Token 过期错误
+                if (e.message?.includes('expired') || e.message?.includes('TOKEN_EXPIRED') || 
+                    e.message?.includes('INVALID_TOKEN') || e.message?.includes('401') ||
+                    e.message?.includes('Unauthorized')) {
+                    console.log('[LDStatus Pro] Token expired or invalid, logging out');
+                    this.logout();
+                    // 触发 UI 更新事件
+                    window.dispatchEvent(new CustomEvent('ldsp_token_expired'));
+                }
+                throw e;
+            }
         }
     }
 
@@ -3074,6 +3133,13 @@
                         this.$.tabs[next].focus();
                     }
                 });
+            });
+            
+            // 监听 Token 过期事件，刷新 UI
+            window.addEventListener('ldsp_token_expired', () => {
+                console.log('[LDStatus Pro] Token expired, refreshing UI');
+                this.renderer.showToast('⚠️ 登录已过期，请重新登录');
+                this._renderLeaderboard();
             });
         }
 
