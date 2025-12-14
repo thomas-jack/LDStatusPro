@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDStatus Pro
 // @namespace    http://tampermonkey.net/
-// @version      3.2.6
+// @version      3.2.7
 // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计。两站点均支持排行榜和云同步功能
 // @author       JackLiii
 // @license      MIT
@@ -1219,9 +1219,10 @@
 
     // ==================== 排行榜管理器 ====================
     class LeaderboardManager {
-        constructor(oauth, readingTracker) {
+        constructor(oauth, readingTracker, storage) {
             this.oauth = oauth;
             this.tracker = readingTracker;
+            this.storage = storage;  // v3.2.7: 用于智能同步缓存
             this.cache = new Map();
             this._syncTimer = null;
             this._lastSync = 0;
@@ -1329,15 +1330,31 @@
 
             try {
                 const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+                const currentMinutes = this.tracker.getTodayTime();
+                
+                // v3.2.7 优化（方案E）：智能同步 - 只在数据变化时才发送请求
+                // 节省约 30% 的 D1 写入额度
+                const lastSyncedKey = `lastSynced_${today}`;
+                const lastSyncedMinutes = this.storage?.getGlobal(lastSyncedKey, -1) ?? -1;
+                
+                if (currentMinutes === lastSyncedMinutes) {
+                    // 数据没变化，跳过同步
+                    console.log('[Leaderboard] Sync skipped - no change:', currentMinutes, 'min');
+                    return;
+                }
+                
                 await this.oauth.api('/api/reading/sync', {
                     method: 'POST',
                     body: { 
                         date: today,
-                        minutes: this.tracker.getTodayTime(),
+                        minutes: currentMinutes,
                         client_timestamp: Date.now()
                     }
                 });
                 this._lastSync = Date.now();
+                
+                // 记录已同步的分钟数
+                this.storage?.setGlobal(lastSyncedKey, currentMinutes);
             } catch (e) {
                 console.warn('[Leaderboard] Sync failed:', e.message || e);
             }
@@ -1956,26 +1973,29 @@
 #ldsp-panel.collapsed .ldsp-hdr{padding:0;justify-content:center;height:44px;background:0 0}
 #ldsp-panel.collapsed .ldsp-hdr-info,#ldsp-panel.collapsed .ldsp-hdr-btns>button:not(.ldsp-toggle),#ldsp-panel.collapsed .ldsp-body{display:none!important}
 #ldsp-panel.collapsed .ldsp-toggle{width:44px;height:44px;font-size:18px;background:0 0}
-.ldsp-hdr{display:flex;align-items:center;justify-content:space-between;padding:var(--pd);background:var(--grad);cursor:move;user-select:none}
+.ldsp-hdr{display:flex;align-items:center;justify-content:space-between;padding:var(--pd);background:var(--grad);cursor:move;user-select:none;min-height:42px}
 .ldsp-hdr-info{display:flex;align-items:center;gap:8px}
-.ldsp-site-icon{width:22px;height:22px;border-radius:50%;border:2px solid rgba(255,255,255,.3)}
-.ldsp-title{font-weight:700;font-size:13px;color:#fff}
-.ldsp-ver{font-size:9px;color:rgba(255,255,255,.8);background:rgba(255,255,255,.2);padding:2px 5px;border-radius:6px}
-.ldsp-hdr-btns{display:flex;gap:4px}
-.ldsp-hdr-btns button{width:26px;height:26px;border:none;background:rgba(255,255,255,.15);color:#fff;border-radius:var(--r-sm);cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center}
+.ldsp-site-icon{width:20px;height:20px;border-radius:50%;border:2px solid rgba(255,255,255,.3);flex-shrink:0}
+.ldsp-hdr-text{display:flex;flex-direction:column;gap:1px;min-width:0}
+.ldsp-title{font-weight:700;font-size:12px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ldsp-ver{font-size:8px;color:rgba(255,255,255,.7);line-height:1}
+.ldsp-hdr-btns{display:flex;gap:3px;flex-shrink:0}
+.ldsp-hdr-btns button{width:24px;height:24px;border:none;background:rgba(255,255,255,.15);color:#fff;border-radius:var(--r-sm);cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .ldsp-hdr-btns button:hover{background:rgba(255,255,255,.25);transform:translateY(-1px)}
 .ldsp-hdr-btns button:disabled{opacity:.6;cursor:not-allowed;transform:none}
-.ldsp-hdr-btns button.has-update{background:var(--ok);animation:pulse-update 2s ease-in-out infinite}
-@keyframes pulse-update{0%,100%{transform:scale(1)}50%{transform:scale(1.1)}}
-.ldsp-update-bubble{position:absolute;top:50px;left:50%;transform:translateX(-50%) scale(0.9);background:var(--bg-card);border:2px solid var(--accent);border-radius:var(--r-lg);padding:16px;text-align:center;z-index:100;box-shadow:0 8px 32px rgba(0,0,0,.3);opacity:0;transition:all .3s ease}
-.ldsp-update-bubble.show{opacity:1;transform:translateX(-50%) scale(1)}
-.ldsp-update-bubble-close{position:absolute;top:8px;right:10px;font-size:16px;cursor:pointer;color:var(--txt-mut);transition:color .2s}
+.ldsp-hdr-btns button.has-update{background:var(--ok);animation:pulse-update 2s ease-in-out infinite;position:relative}
+.ldsp-hdr-btns button.has-update::after{content:'';position:absolute;top:-2px;right:-2px;width:8px;height:8px;background:var(--err);border-radius:50%;border:1px solid var(--bg)}
+@keyframes pulse-update{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+.ldsp-update-bubble{position:absolute;top:48px;left:50%;transform:translateX(-50%) translateY(-8px);background:var(--bg-card);border:1px solid var(--accent);border-radius:var(--r-md);padding:12px 14px;text-align:center;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.25);opacity:0;pointer-events:none;transition:all .25s var(--ease);max-width:calc(100% - 20px);width:200px}
+.ldsp-update-bubble::before{content:'';position:absolute;top:-6px;left:50%;transform:translateX(-50%) rotate(45deg);width:10px;height:10px;background:var(--bg-card);border-left:1px solid var(--accent);border-top:1px solid var(--accent)}
+.ldsp-update-bubble.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto}
+.ldsp-update-bubble-close{position:absolute;top:6px;right:8px;font-size:14px;cursor:pointer;color:var(--txt-mut);transition:color .2s;line-height:1}
 .ldsp-update-bubble-close:hover{color:var(--txt)}
-.ldsp-update-bubble-icon{font-size:32px;margin-bottom:8px}
-.ldsp-update-bubble-title{font-size:14px;font-weight:700;margin-bottom:6px;color:var(--txt)}
-.ldsp-update-bubble-ver{font-size:12px;margin-bottom:12px}
-.ldsp-update-bubble-btn{background:var(--grad);color:#fff;border:none;padding:8px 20px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
-.ldsp-update-bubble-btn:hover{transform:scale(1.05);box-shadow:0 4px 12px rgba(124,58,237,.4)}
+.ldsp-update-bubble-icon{font-size:24px;margin-bottom:6px}
+.ldsp-update-bubble-title{font-size:12px;font-weight:700;margin-bottom:4px;color:var(--txt)}
+.ldsp-update-bubble-ver{font-size:10px;margin-bottom:10px;color:var(--txt-sec)}
+.ldsp-update-bubble-btn{background:var(--grad);color:#fff;border:none;padding:6px 16px;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s}
+.ldsp-update-bubble-btn:hover{transform:scale(1.03);box-shadow:0 4px 12px rgba(124,58,237,.35)}
 .ldsp-update-bubble-btn:disabled{opacity:.7;cursor:not-allowed;transform:none}
 .ldsp-body{background:var(--bg)}
 .ldsp-user{display:flex;align-items:center;gap:10px;padding:var(--pd);background:var(--bg-card);border-bottom:1px solid var(--border)}
@@ -2223,7 +2243,10 @@
 .ldsp-privacy-note{font-size:8px;color:var(--txt-mut);margin-top:8px;display:flex;align-items:center;justify-content:center;gap:4px}
 @media (prefers-reduced-motion:reduce){#ldsp-panel,#ldsp-panel *{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 @media (max-height:700px){#ldsp-panel{top:60px}.ldsp-content{max-height:calc(100vh - 240px)}}
-@media (max-width:1200px){#ldsp-panel{left:8px}}`;
+@media (max-width:1200px){#ldsp-panel{left:8px}}
+@media (max-width:768px){#ldsp-panel{--w:280px;--fs:12px;--pd:10px;left:6px;top:70px}#ldsp-panel.collapsed{width:36px!important;height:36px!important}#ldsp-panel.collapsed .ldsp-toggle{width:36px;height:36px;font-size:14px}.ldsp-hdr{padding:8px 10px}.ldsp-site-icon{width:18px;height:18px}.ldsp-title{font-size:11px}.ldsp-ver{font-size:7px}.ldsp-hdr-btns{gap:2px}.ldsp-hdr-btns button{width:22px;height:22px;font-size:10px}.ldsp-update-bubble{width:180px;padding:10px 12px}.ldsp-content{max-height:calc(100vh - 260px)}}
+@media (max-width:480px){#ldsp-panel{--w:260px;--av:32px;left:4px;top:60px}#ldsp-panel.collapsed{width:32px!important;height:32px!important}#ldsp-panel.collapsed .ldsp-toggle{width:32px;height:32px;font-size:12px}.ldsp-hdr{padding:6px 8px}.ldsp-hdr-btns button{width:20px;height:20px;font-size:9px}.ldsp-site-icon{width:16px;height:16px}.ldsp-user{padding:8px}.ldsp-reading{min-width:60px;padding:4px 6px}.ldsp-reading-time{font-size:11px}.ldsp-tabs{padding:6px 8px;gap:4px}.ldsp-tab{padding:5px 8px;font-size:10px}.ldsp-rank-item{padding:8px}.ldsp-rank-num{width:20px;font-size:11px}.ldsp-my-rank{padding:8px}.ldsp-my-rank-val{font-size:14px}}
+@media (max-height:500px){#ldsp-panel{top:40px}.ldsp-content{max-height:calc(100vh - 180px)}.ldsp-user{padding:6px}.ldsp-reading{display:none}}`;
         }
     };
 
@@ -2866,7 +2889,7 @@
             this.hasLeaderboard = CURRENT_SITE.supportsLeaderboard;
             if (this.hasLeaderboard) {
                 this.oauth = new OAuthManager(this.storage, this.network);
-                this.leaderboard = new LeaderboardManager(this.oauth, this.tracker);
+                this.leaderboard = new LeaderboardManager(this.oauth, this.tracker, this.storage);
                 this.cloudSync = new CloudSyncManager(this.storage, this.oauth, this.tracker);
                 this.cloudSync.setHistoryManager(this.historyMgr);  // 设置历史管理器引用
                 this.lbTab = this.storage.getGlobal('leaderboardTab', 'daily');
@@ -2956,8 +2979,10 @@
                 <div class="ldsp-hdr">
                     <div class="ldsp-hdr-info">
                         <img class="ldsp-site-icon" src="${CURRENT_SITE.icon}" alt="${CURRENT_SITE.name}">
-                        <span class="ldsp-title">${CURRENT_SITE.name}</span>
-                        <span class="ldsp-ver">v${GM_info.script.version}</span>
+                        <div class="ldsp-hdr-text">
+                            <span class="ldsp-title">${CURRENT_SITE.name}</span>
+                            <span class="ldsp-ver">v${GM_info.script.version}</span>
+                        </div>
                     </div>
                     <div class="ldsp-hdr-btns">
                         <button class="ldsp-update" title="检查更新">🔍</button>
