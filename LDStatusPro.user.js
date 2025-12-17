@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         LDStatus Pro
 // @namespace    http://tampermonkey.net/
-// @version      3.4.7
+// @version      3.4.8
 // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计、排行榜系统。两站点均支持排行榜和云同步功能
 // @author       JackLiii
 // @license      MIT
@@ -737,19 +737,73 @@
             }
         }
 
-        _doFetch(url, timeout) {
-            return new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url,
-                    timeout,
-                    onload: res => res.status >= 200 && res.status < 300 
-                        ? resolve(res.responseText) 
-                        : reject(new Error(`HTTP ${res.status}`)),
-                    onerror: () => reject(new Error('Network error')),
-                    ontimeout: () => reject(new Error('Timeout'))
-                });
+        async _doFetch(url, timeout) {
+            // 检测 GM_xmlhttpRequest 是否可用
+            const hasGM = typeof GM_xmlhttpRequest === 'function';
+            
+            // 方法1: 尝试 GM_xmlhttpRequest（可绕过跨域）
+            if (hasGM) {
+                try {
+                    const result = await new Promise((resolve, reject) => {
+                        let settled = false;
+                        const timeoutId = setTimeout(() => {
+                            if (!settled) {
+                                settled = true;
+                                reject(new Error('Timeout'));
+                            }
+                        }, timeout);
+                        
+                        try {
+                            GM_xmlhttpRequest({
+                                method: 'GET',
+                                url,
+                                timeout,
+                                onload: res => {
+                                    if (settled) return;
+                                    settled = true;
+                                    clearTimeout(timeoutId);
+                                    if (res.status >= 200 && res.status < 300) {
+                                        resolve(res.responseText);
+                                    } else {
+                                        reject(new Error(`HTTP ${res.status}`));
+                                    }
+                                },
+                                onerror: () => {
+                                    if (settled) return;
+                                    settled = true;
+                                    clearTimeout(timeoutId);
+                                    reject(new Error('Network error'));
+                                },
+                                ontimeout: () => {
+                                    if (settled) return;
+                                    settled = true;
+                                    clearTimeout(timeoutId);
+                                    reject(new Error('GM Timeout'));
+                                }
+                            });
+                        } catch (gmCallError) {
+                            if (settled) return;
+                            settled = true;
+                            clearTimeout(timeoutId);
+                            reject(gmCallError);
+                        }
+                    });
+                    return result;
+                } catch (gmError) {
+                    // 继续尝试 native fetch
+                }
+            }
+            
+            // 方法2: native fetch 作为 fallback（跨域可能失败）
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+            const resp = await fetch(url, { 
+                credentials: 'include',
+                signal: controller.signal
             });
+            clearTimeout(timeoutId);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            return await resp.text();
         }
 
         // API 请求（带认证和缓存）
@@ -4517,7 +4571,32 @@
             this.$.reqs.innerHTML = `<div class="ldsp-loading"><div class="ldsp-spinner"></div><div>加载中...</div></div>`;
 
             try {
-                const html = await this.network.fetch(CURRENT_SITE.apiUrl);
+                let html = null;
+                const url = CURRENT_SITE.apiUrl;
+                
+                // 方法1: 使用 GM_xmlhttpRequest（优先，可绕过跨域限制）
+                try {
+                    html = await this.network.fetch(url);
+                } catch (e) { /* GM fetch 失败，尝试 fallback */ }
+                
+                // 方法2: native fetch 作为 fallback
+                if (!html) {
+                    try {
+                        const resp = await fetch(url, { 
+                            credentials: 'include',
+                            mode: 'cors',
+                            headers: { 'Accept': 'text/html' }
+                        });
+                        if (resp.ok) {
+                            html = await resp.text();
+                        }
+                    } catch (e) { /* native fetch 失败 */ }
+                }
+                
+                if (!html) {
+                    throw new Error('无法获取数据');
+                }
+                
                 await this._parse(html);
             } catch (e) {
                 this._showError(e.message || '网络错误');
@@ -4553,37 +4632,56 @@
                     const updatedUserInfo = { ...userInfo, trust_level: connectLevel };
                     this.oauth.setUserInfo(updatedUserInfo);
                 }
-            } catch (e) {
-                console.warn('[LDStatus Pro] Failed to sync trust level:', e.message);
-            }
+            } catch (e) { /* 同步失败，忽略 */ }
         }
 
-        // 当没有升级要求表格时显示备选内容（尝试从 summary 获取统计数据）
+        // 当没有升级要求表格时显示备选内容
+        // 优先级：1. 服务端同步的数据 2. summary API 数据
         async _showFallbackStats(username, level) {
             const $ = this.$;
-            // 显示用户信息（如果有）
-            if (username && username !== '未知') {
-                $.userDisplayName.textContent = username;
-                $.userHandle.textContent = '';
-                $.userHandle.style.display = 'none';
-            }
             
-            // 获取信任等级
+            // 优先从 OAuth 获取用户信息（更可靠，尤其在移动端）
+            let effectiveUsername = username;
             let numLevel = parseInt(level) || 0;
-            if (this.oauth) {
+            
+            if (this.oauth?.isLoggedIn()) {
                 const oauthUser = this.oauth.getUserInfo();
+                // 优先使用 OAuth 中的用户名
+                if (oauthUser?.username) {
+                    effectiveUsername = oauthUser.username;
+                }
+                // 优先使用 OAuth 中的信任等级
                 const oauthTrustLevel = oauthUser?.trust_level ?? oauthUser?.trustLevel;
                 if (typeof oauthTrustLevel === 'number') {
                     numLevel = oauthTrustLevel;
                 }
             }
             
-            // 尝试从 summary 页面获取统计数据
-            if (username && username !== '未知') {
+            // 显示用户信息
+            if (effectiveUsername && effectiveUsername !== '未知') {
+                $.userDisplayName.textContent = effectiveUsername;
+                $.userHandle.textContent = '';
+                $.userHandle.style.display = 'none';
+            }
+            
+            // === 方案1：优先从服务端获取已同步的升级要求数据 ===
+            // 这些数据是桌面端解析 connect 页面后上传的，最完整准确
+            if (this.oauth?.isLoggedIn() && this.cloudSync) {
+                this.$.reqs.innerHTML = `<div class="ldsp-loading"><div class="ldsp-spinner"></div><div>正在获取云端数据...</div></div>`;
+                try {
+                    const cloudData = await this._fetchCloudRequirements();
+                    if (cloudData && cloudData.length > 0) {
+                        return this._renderCloudRequirements(cloudData, effectiveUsername, numLevel);
+                    }
+                } catch (e) { /* 云端获取失败，继续尝试 summary */ }
+            }
+            
+            // === 方案2：从 summary API 获取统计数据 ===
+            if (effectiveUsername && effectiveUsername !== '未知') {
                 this.$.reqs.innerHTML = `<div class="ldsp-loading"><div class="ldsp-spinner"></div><div>正在获取统计数据...</div></div>`;
-                const summaryData = await this._fetchSummaryData(username);
+                const summaryData = await this._fetchSummaryData(effectiveUsername);
                 if (summaryData && Object.keys(summaryData).length > 0) {
-                    return this._renderSummaryData(summaryData, username, numLevel);
+                    return this._renderSummaryData(summaryData, effectiveUsername, numLevel);
                 }
             }
             
@@ -4612,6 +4710,129 @@
             this.cachedReqs = []; // 空的升级要求数组
             this._renderTrends(history, []);
         }
+
+        /**
+         * 从服务端获取最近同步的升级要求数据
+         * @returns {Array|null} - 升级要求数组或 null
+         */
+        async _fetchCloudRequirements() {
+            try {
+                // 获取最近一天的历史数据
+                const result = await this.cloudSync.oauth.api('/api/requirements/history?days=1');
+                if (!result?.success || !result.data?.history?.length) {
+                    return null;
+                }
+                
+                // 取最新的一条记录
+                const latestRecord = result.data.history[result.data.history.length - 1];
+                if (!latestRecord?.data) return null;
+                
+                // 转换为升级要求数组格式
+                const reqs = [];
+                for (const [name, value] of Object.entries(latestRecord.data)) {
+                    if (name === '阅读时间(分钟)') continue; // 跳过阅读时间
+                    reqs.push({
+                        name,
+                        currentValue: value,
+                        requiredValue: 0, // 从配置获取
+                        isSuccess: false,
+                        change: 0,
+                        isReverse: /举报|禁言|封禁/.test(name)
+                    });
+                }
+                
+                return reqs.length > 0 ? reqs : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        /**
+         * 渲染从云端获取的升级要求数据
+         * @param {Array} cloudReqs - 云端数据数组
+         * @param {string} username - 用户名
+         * @param {number} level - 信任等级
+         */
+        _renderCloudRequirements(cloudReqs, username, level) {
+            // 2-4级用户的升级/保持要求配置（基于 connect 页面的 14 项要求）
+            const LEVEL_2_PLUS_REQUIREMENTS = {
+                '访问次数': 50,           // 50%
+                '回复的话题': 10,
+                '浏览的话题': 500,
+                '浏览的话题（所有时间）': 200,
+                '已读帖子': 20000,
+                '已读帖子（所有时间）': 500,
+                '被举报的帖子': 5,         // 最多5个（反向）
+                '发起举报的用户': 5,       // 最多5个（反向）
+                '点赞': 30,
+                '获赞': 20,
+                '获赞：单日最高数量': 7,
+                '获赞：点赞用户数量': 5,
+                '被禁言（过去 6 个月）': 0, // 必须为0（反向）
+                '被封禁（过去 6 个月）': 0  // 必须为0（反向）
+            };
+            
+            // 为云端数据填充要求值
+            const reqs = cloudReqs.map(req => {
+                const requiredValue = LEVEL_2_PLUS_REQUIREMENTS[req.name] ?? 0;
+                const isReverse = /举报|禁言|封禁/.test(req.name);
+                const isSuccess = isReverse 
+                    ? req.currentValue <= requiredValue 
+                    : req.currentValue >= requiredValue;
+                
+                return {
+                    ...req,
+                    requiredValue,
+                    isSuccess,
+                    isReverse
+                };
+            });
+            
+            // 按照配置顺序排序
+            const orderedNames = Object.keys(LEVEL_2_PLUS_REQUIREMENTS);
+            const orderedReqs = reqs.sort((a, b) => {
+                const idxA = orderedNames.indexOf(a.name);
+                const idxB = orderedNames.indexOf(b.name);
+                if (idxA === -1 && idxB === -1) return 0;
+                if (idxA === -1) return 1;
+                if (idxB === -1) return -1;
+                return idxA - idxB;
+            });
+            
+            // 检查是否达标
+            const isOK = orderedReqs.every(r => r.isSuccess);
+            
+            // 保存历史数据
+            const histData = {};
+            orderedReqs.forEach(r => histData[r.name] = r.currentValue);
+            const history = this.historyMgr.addHistory(histData, this.readingTime);
+            
+            // 保存今日数据
+            const todayData = this._getTodayData();
+            this._setTodayData(histData, !todayData);
+            
+            // 获取显示名称
+            let displayName = null;
+            if (this.hasLeaderboard && this.oauth?.isLoggedIn()) {
+                const oauthUser = this.oauth.getUserInfo();
+                if (oauthUser?.name && oauthUser.name !== oauthUser.username) {
+                    displayName = oauthUser.name;
+                }
+            }
+            
+            // 渲染
+            this.renderer.renderUser(username, level.toString(), isOK, orderedReqs, displayName);
+            this.renderer.renderReqs(orderedReqs, level);
+            
+            this.cachedHistory = history;
+            this.cachedReqs = orderedReqs;
+            
+            this._renderTrends(history, orderedReqs);
+            this._setLastVisit(histData);
+            this.prevReqs = orderedReqs;
+            
+            return true;
+        }
         
         /**
          * 从 summary.json API 获取用户统计数据 (使用 user_summary 字段)
@@ -4625,10 +4846,30 @@
                 
                 // 优先使用 summary.json API（Discourse 标准 API）的 user_summary 字段
                 const jsonUrl = `${baseUrl}/u/${encodeURIComponent(username)}/summary.json`;
+                
+                // 尝试多种方式获取数据，兼容不同的用户脚本管理器
+                let jsonText = null;
+                
+                // 方法1: 使用 GM_xmlhttpRequest
                 try {
-                    // 使用 GM_xmlhttpRequest 以支持跨域和 cookie
-                    const jsonText = await this.network.fetch(jsonUrl, { maxRetries: 2, timeout: 10000 });
-                    if (jsonText) {
+                    jsonText = await this.network.fetch(jsonUrl, { maxRetries: 2, timeout: 10000 });
+                } catch (e) { /* GM fetch 失败 */ }
+                
+                // 方法2: 如果 GM 方式失败，尝试原生 fetch（同源请求更可靠）
+                if (!jsonText) {
+                    try {
+                        const response = await fetch(jsonUrl, { 
+                            credentials: 'include',
+                            headers: { 'Accept': 'application/json' }
+                        });
+                        if (response.ok) {
+                            jsonText = await response.text();
+                        }
+                    } catch (e) { /* native fetch 失败 */ }
+                }
+                
+                if (jsonText) {
+                    try {
                         const json = JSON.parse(jsonText);
                         
                         // 从 user_summary 字段提取统计数据
@@ -4649,15 +4890,31 @@
                                 return data;
                             }
                         }
-                    }
-                } catch (jsonErr) {
-                    // JSON API 失败，继续尝试 HTML 解析
+                    } catch (e) { /* JSON 解析失败 */ }
                 }
                 
                 // 方法B：回退到 HTML 解析
                 const url = `${baseUrl}/u/${encodeURIComponent(username)}/summary`;
-                const html = await this.network.fetch(url, { maxRetries: 2 });
-                if (!html) return null;
+                let html = null;
+                
+                // 先尝试 GM_xmlhttpRequest
+                try {
+                    html = await this.network.fetch(url, { maxRetries: 2 });
+                } catch (e) { /* GM fetch 失败 */ }
+                
+                // 备用：原生 fetch
+                if (!html) {
+                    try {
+                        const resp = await fetch(url, { credentials: 'include' });
+                        if (resp.ok) {
+                            html = await resp.text();
+                        }
+                    } catch (e) { /* native fetch 失败 */ }
+                }
+                
+                if (!html) {
+                    return null;
+                }
                 
                 const doc = new DOMParser().parseFromString(html, 'text/html');
                 
@@ -4759,7 +5016,6 @@
                 
                 return Object.keys(data).length > 0 ? data : null;
             } catch (e) {
-                console.warn('[LDStatus Pro] Failed to fetch summary data:', e.message);
                 return null;
             }
         }
@@ -4772,22 +5028,50 @@
             // 构建要求数据结构（用于显示和趋势）
             const reqs = [];
             
-            // 根据 Discourse 官方升级要求配置
-            // 0→1: 进入5个话题、阅读30篇帖子、花费10分钟阅读（阅读时间无法从summary获取，不显示）
-            // 1→2: 访问15天、点赞1次、获赞1次、回复3个话题、进入20个话题、阅读100篇帖子、花费60分钟阅读
-            const statsConfig = level === 0 ? [
-                // 0级升1级要求
-                { key: '浏览话题', required: 5 },
-                { key: '已读帖子', required: 30 }
-            ] : [
-                // 1级升2级要求
-                { key: '访问天数', required: 15 },
-                { key: '浏览话题', required: 20 },
-                { key: '已读帖子', required: 100 },
-                { key: '送出赞', required: 1 },
-                { key: '获赞', required: 1 },
-                { key: '回复', required: 3 }
-            ];
+            // 这是 connect 页面获取失败时的 fallback 方案
+            // summary API 只能提供有限的累计统计数据（约8项）
+            // 注意：summary API 返回的是累计总数，而 2→3 级升级要求是"过去100天"的数据
+            // 因此这里的数据仅供参考，不能完全代表升级进度
+            // 升级要求参考: https://linux.do/t/topic/2460
+            let statsConfig;
+            
+            if (level === 0) {
+                // 0级升1级要求：
+                // - 进入5个话题、阅读30篇帖子、阅读10分钟
+                statsConfig = [
+                    { key: '浏览话题', required: 5 },
+                    { key: '已读帖子', required: 30 },
+                    { key: '阅读时间', required: 10 }  // 10分钟
+                ];
+            } else if (level === 1) {
+                // 1级升2级要求：
+                // - 访问15天、浏览20话题、阅读100帖子、阅读60分钟
+                // - 送出和收到各1个赞、回复3个不同话题
+                statsConfig = [
+                    { key: '访问天数', required: 15 },
+                    { key: '浏览话题', required: 20 },
+                    { key: '已读帖子', required: 100 },
+                    { key: '阅读时间', required: 60 },  // 60分钟
+                    { key: '送出赞', required: 1 },
+                    { key: '获赞', required: 1 },
+                    { key: '回复', required: 3 }  // 3个不同话题
+                ];
+            } else {
+                // 2级及以上用户：仅显示统计数据，不显示升级要求
+                // 重要：2级用户的升级进度应从 connect 页面获取（有详细的100天内数据）
+                // 这里只是 connect 页面完全无法获取时的兜底方案
+                // summary API 返回的是累计数据，无法反映真实的升级进度
+                statsConfig = [
+                    { key: '访问天数', required: 0, isStats: true },
+                    { key: '浏览话题', required: 0, isStats: true },
+                    { key: '已读帖子', required: 0, isStats: true },
+                    { key: '送出赞', required: 0, isStats: true },
+                    { key: '获赞', required: 0, isStats: true },
+                    { key: '回复', required: 0, isStats: true },
+                    { key: '创建话题', required: 0, isStats: true },
+                    { key: '阅读时间', required: 0, isStats: true }
+                ];
+            }
             
             statsConfig.forEach(config => {
                 // 获取当前值（如果没有数据则默认为 0）
@@ -4887,6 +5171,35 @@
             // 3. 查找包含信任级别的区块获取更多信息
             const section = [...doc.querySelectorAll('.bg-white.p-6.rounded-lg')].find(d => d.querySelector('h2')?.textContent.includes('信任级别'));
             
+
+            
+            // 如果没找到 section，检查原因
+            if (!section) {
+                // 检查是否返回了错误的页面（主站而非 connect）
+                const isMainSite = html?.includes('欢迎来到 LINUX DO') || doc.querySelector('title')?.textContent?.includes('LINUX DO -');
+                const isConnectPage = html?.includes('信任级别') || html?.includes('trust level');
+                
+                if (isMainSite && !isConnectPage) {
+                    // 返回了主站页面，说明 connect 认证失败（常见于 iOS Safari + Stay）
+                    // 使用 OAuth 缓存的用户信息
+                    let oauthUsername = username;
+                    let oauthLevel = level;
+                    
+                    if (this.oauth?.isLoggedIn()) {
+                        const oauthUser = this.oauth.getUserInfo();
+                        if (oauthUser?.username) oauthUsername = oauthUser.username;
+                        const trustLevel = oauthUser?.trust_level ?? oauthUser?.trustLevel;
+                        if (typeof trustLevel === 'number') oauthLevel = trustLevel.toString();
+                    }
+                    
+                    // 直接使用 fallback 显示，不弹窗打扰用户
+                    console.warn('[LDStatus Pro] Connect 页面认证失败，使用 summary 数据');
+                    return await this._showFallbackStats(oauthUsername, oauthLevel);
+                }
+                
+                return await this._showFallbackStats(username, level);
+            }
+            
             if (section) {
                 const heading = section.querySelector('h2').textContent;
                 const match = heading.match(PATTERNS.TRUST_LEVEL);
@@ -4921,7 +5234,7 @@
                 this._updateTrustLevel(connectLevel);
             }
             
-            // 如果没有升级要求表格，尝试从 summary 页面获取统计数据
+            // 如果没有找到升级要求区块，fallback 到 summary 数据
             if (!section) {
                 return await this._showFallbackStats(username, level);
             }
