@@ -1,0 +1,129 @@
+# GitHub Actions 自动发布工作流
+# 当推送带有 v* 标签时自动创建 Release
+#
+# 触发方式:
+#   1. 使用 release.ps1 脚本（推荐）
+#   2. 手动创建并推送 tag: git tag -a v3.4.7 -m "Release v3.4.7" && git push origin v3.4.7
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史以便提取 changelog
+      
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          VERSION_NUM="${VERSION#v}"
+          
+          echo "Looking for version: $VERSION_NUM"
+          
+          # 尝试多种格式提取 changelog
+          # 格式1: ### 3.4.7 (2024-xx-xx)
+          # 格式2: ### v3.4.7
+          # 格式3: ## 3.4.7
+          
+          if [ -f "update_log.md" ]; then
+            # 提取从当前版本到下一个版本标记之间的内容
+            CHANGELOG=$(awk "
+              /^###? v?${VERSION_NUM}/ { found=1; next }
+              /^###? v?[0-9]+\.[0-9]+\.[0-9]+/ { if(found) exit }
+              found { print }
+            " update_log.md)
+            
+            # 清理空行
+            CHANGELOG=$(echo "$CHANGELOG" | sed '/^$/d' | head -20)
+          fi
+          
+          # 如果没找到，使用默认内容
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="请查看 [update_log.md](./update_log.md) 了解详细更新内容。"
+          fi
+          
+          # 保存到 GitHub Output (使用 heredoc 支持多行)
+          {
+            echo 'CHANGELOG<<CHANGELOG_EOF'
+            echo "$CHANGELOG"
+            echo 'CHANGELOG_EOF'
+          } >> $GITHUB_OUTPUT
+          
+          echo "Extracted changelog:"
+          echo "$CHANGELOG"
+      
+      - name: Get script info
+        id: script_info
+        run: |
+          # 从脚本中提取信息
+          SCRIPT_NAME=$(grep -oP '// @name\s+\K.*' LDStatusPro.user.js | head -1)
+          SCRIPT_DESC=$(grep -oP '// @description\s+\K.*' LDStatusPro.user.js | head -1)
+          
+          echo "SCRIPT_NAME=$SCRIPT_NAME" >> $GITHUB_OUTPUT
+          echo "SCRIPT_DESC=$SCRIPT_DESC" >> $GITHUB_OUTPUT
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.script_info.outputs.SCRIPT_NAME }} ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## 🎉 ${{ steps.version.outputs.VERSION }} 更新内容
+            
+            ${{ steps.changelog.outputs.CHANGELOG }}
+            
+            ---
+            
+            ## 📥 安装方式
+            
+            ### 方式一：直接安装（推荐）
+            
+            确保已安装脚本管理器，然后点击下方链接：
+            
+            **[🔗 点击安装 LDStatus Pro](https://raw.githubusercontent.com/${{ github.repository }}/main/LDStatusPro.user.js)**
+            
+            ### 方式二：从 GreasyFork 安装
+            
+            访问 [GreasyFork 页面](https://greasyfork.org/scripts/YOUR_SCRIPT_ID) 安装（可能有延迟）
+            
+            ---
+            
+            ## 📋 支持的脚本管理器
+            
+            | 平台 | 脚本管理器 | 状态 |
+            |------|-----------|------|
+            | Chrome/Edge/Firefox | Tampermonkey | ✅ 完全支持 |
+            | Chrome/Edge/Firefox | Violentmonkey | ✅ 完全支持 |
+            | Safari (macOS) | Tampermonkey / Userscripts | ✅ 完全支持 |
+            | Safari (iOS) | Stay | ✅ 完全支持 |
+            
+            ---
+            
+            ## 🔄 如何更新
+            
+            - **自动更新**: 脚本管理器会定期检查更新（通常 1-24 小时）
+            - **手动更新**: 在脚本管理器中点击"检查更新"
+            
+          files: |
+            LDStatusPro.user.js
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'alpha') }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
