@@ -1,12 +1,13 @@
 ﻿// ==UserScript==
 // @name         LDStatus Pro
 // @namespace    http://tampermonkey.net/
-// @version      3.4.1
+// @version      3.4.5
 // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计、排行榜系统。两站点均支持排行榜和云同步功能
 // @author       JackLiii
 // @license      MIT
 // @match        https://linux.do/*
 // @match        https://idcflare.com/*
+// @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -27,6 +28,41 @@
 
 (function() {
     'use strict';
+
+    // ==================== 尽早捕获 OAuth 登录结果 ====================
+    // 由于 Discourse 路由可能会处理掉 URL hash，需要在脚本最开始就提取
+    let _pendingOAuthData = null;
+    try {
+        const hash = window.location.hash;
+        console.log('[OAuth] Initial hash check:', hash ? hash.substring(0, 100) + '...' : '(empty)');
+        if (hash) {
+            const match = hash.match(/ldsp_oauth=([^&]+)/);
+            if (match) {
+                console.log('[OAuth] Found ldsp_oauth in hash, decoding...');
+                const encoded = match[1];
+                const decoded = JSON.parse(decodeURIComponent(atob(encoded)));
+                console.log('[OAuth] Decoded data:', { hasToken: !!decoded.t, hasUser: !!decoded.u, ts: decoded.ts });
+                // 检查时效性（5分钟内有效）
+                if (decoded.ts && Date.now() - decoded.ts < 5 * 60 * 1000) {
+                    _pendingOAuthData = {
+                        success: true,
+                        token: decoded.t,
+                        user: decoded.u,
+                        isJoined: decoded.j === 1
+                    };
+                    console.log('[OAuth] ✅ Captured login data from URL hash, user:', decoded.u?.username);
+                } else {
+                    console.log('[OAuth] ⚠️ Login data expired, age:', Date.now() - decoded.ts, 'ms');
+                }
+                // 立即清除 URL 中的登录参数
+                let newHash = hash.replace(/[#&]?ldsp_oauth=[^&]*/, '').replace(/^[#&]+/, '').replace(/[#&]+$/, '');
+                const newUrl = window.location.pathname + window.location.search + (newHash ? '#' + newHash : '');
+                history.replaceState(null, '', newUrl);
+            }
+        }
+    } catch (e) {
+        console.warn('[OAuth] Failed to capture OAuth data:', e);
+    }
 
     // ==================== 浏览器兼容性检查 ====================
     // 检测必需的 API 是否存在
@@ -1277,87 +1313,103 @@
         isJoined() { return this.storage.getGlobal('leaderboardJoined', false); }
         setJoined(v) { this.storage.setGlobalNow('leaderboardJoined', v); }
 
-        async login() {
-            const authWindow = window.open('about:blank', 'oauth_login', 'width=600,height=700');
-            if (!authWindow) throw new Error('弹窗被拦截');
-
-            return new Promise((resolve, reject) => {
-                // 传递当前站点信息用于多站点 OAuth
-                const siteParam = encodeURIComponent(CURRENT_SITE.domain);
-                this.network.api(`/api/auth/init?site=${siteParam}`).then(result => {
-                    if (result.success && result.data?.auth_url) {
-                        authWindow.location.href = result.data.auth_url;
-                        this._listenCallback(authWindow, resolve, reject);
-                    } else {
-                        authWindow.close();
-                        reject(new Error(result.error?.message || '获取授权链接失败'));
-                    }
-                }).catch(e => {
-                    authWindow.close();
-                    reject(e);
-                });
-            });
+        /**
+         * 检查 URL hash 中的登录结果
+         * 统一同窗口登录模式：回调后通过 URL hash 传递登录结果
+         */
+        _checkUrlHashLogin() {
+            try {
+                const hash = window.location.hash;
+                if (!hash) return null;
+                
+                // 查找 ldsp_oauth 参数
+                const match = hash.match(/ldsp_oauth=([^&]+)/);
+                if (!match) return null;
+                
+                const encoded = match[1];
+                // 解码 base64
+                const decoded = JSON.parse(decodeURIComponent(atob(encoded)));
+                
+                // 检查时效性（5分钟内有效）
+                if (decoded.ts && Date.now() - decoded.ts > 5 * 60 * 1000) {
+                    console.log('[OAuth] URL login result expired');
+                    this._clearUrlHash();
+                    return null;
+                }
+                
+                // 转换为标准格式
+                const result = {
+                    success: true,
+                    token: decoded.t,
+                    user: decoded.u,
+                    isJoined: decoded.j === 1
+                };
+                
+                // 清除 URL 中的登录参数，保持 URL 干净
+                this._clearUrlHash();
+                
+                return result;
+            } catch (e) {
+                console.error('[OAuth] Failed to parse URL hash login:', e);
+                this._clearUrlHash();
+                return null;
+            }
+        }
+        
+        /**
+         * 清除 URL 中的 OAuth 登录参数
+         */
+        _clearUrlHash() {
+            try {
+                const hash = window.location.hash;
+                if (!hash || !hash.includes('ldsp_oauth=')) return;
+                
+                // 移除 ldsp_oauth 参数
+                let newHash = hash.replace(/[#&]?ldsp_oauth=[^&]*/, '');
+                // 清理多余的 # 和 &
+                newHash = newHash.replace(/^[#&]+/, '').replace(/[#&]+$/, '');
+                
+                // 更新 URL（不触发页面刷新）
+                const newUrl = window.location.pathname + window.location.search + (newHash ? '#' + newHash : '');
+                history.replaceState(null, '', newUrl);
+            } catch (e) {
+                console.warn('[OAuth] Failed to clear URL hash:', e);
+            }
         }
 
-        _listenCallback(win, resolve, reject) {
-            // 允许的 postMessage 来源列表（放宽限制以解决某些用户无法登录的问题）
-            const ALLOWED_ORIGINS = [
-                'https://ldstatus-pro-api.jackcai711.workers.dev',
-                CONFIG.LEADERBOARD_API
-            ];
+        /**
+         * 统一同窗口登录
+         * 所有环境都使用同窗口跳转方式，避免弹窗拦截和跨窗口通信问题
+         */
+        async login() {
+            // 检查是否有待处理的登录结果（从 URL hash 中获取）
+            const pendingResult = this._checkUrlHashLogin();
+            if (pendingResult?.success && pendingResult.token && pendingResult.user) {
+                this.setToken(pendingResult.token);
+                this.setUserInfo(pendingResult.user);
+                this.setJoined(pendingResult.isJoined || false);
+                return pendingResult.user;
+            }
 
-            let resolved = false;
-            const cleanup = () => {
-                clearInterval(check);
-                window.removeEventListener('message', handler);
-            };
-
-            const check = setInterval(() => {
-                if (win.closed && !resolved) {
-                    cleanup();
-                    // 延迟检查，给 postMessage 一些时间
-                    setTimeout(() => {
-                        if (!resolved) {
-                            this.isLoggedIn() ? resolve(this.getUserInfo()) : reject(new Error('登录已取消'));
-                        }
-                    }, 800);
-                }
-            }, 500);
-
-            const handler = (e) => {
-                // 只检查消息类型，放宽来源验证（因为 workers.dev 子域名可能变化）
-                // 安全性由 OAuth state 签名和 JWT token 保证
-                if (e.data?.type !== 'ldsp_oauth_callback') return;
+            // 获取授权链接并跳转（同窗口模式）
+            const siteParam = encodeURIComponent(CURRENT_SITE.domain);
+            // 使用不带 hash 的 URL 作为返回地址
+            const returnUrl = encodeURIComponent(window.location.origin + window.location.pathname + window.location.search);
+            
+            try {
+                const result = await this.network.api(`/api/auth/init?site=${siteParam}&return_url=${returnUrl}`);
                 
-                // 记录来源用于调试
-                const isKnownOrigin = ALLOWED_ORIGINS.some(origin => e.origin === origin) || e.origin.endsWith('.workers.dev');
-                if (!isKnownOrigin) {
-                    console.warn('[LDStatus Pro] OAuth callback from unexpected origin:', e.origin);
-                }
-
-                resolved = true;
-                cleanup();
-                
-                if (e.data.success && e.data.token && e.data.user) {
-                    this.setToken(e.data.token);
-                    this.setUserInfo(e.data.user);
-                    this.setJoined(e.data.isJoined || false);
-                    try { win.closed || win.close(); } catch (e) {}
-                    resolve(e.data.user);
+                if (result.success && result.data?.auth_url) {
+                    // 跳转到授权页面
+                    window.location.href = result.data.auth_url;
+                    // 返回一个永不 resolve 的 Promise（页面会跳转，不会执行后续代码）
+                    return new Promise(() => {});
                 } else {
-                    try { win.closed || win.close(); } catch (e) {}
-                    reject(new Error(e.data.error || '登录失败'));
+                    throw new Error(result.error?.message || '获取授权链接失败');
                 }
-            };
-            window.addEventListener('message', handler);
-
-            // 2分钟超时
-            setTimeout(() => {
-                if (!resolved) {
-                    cleanup();
-                    reject(new Error('登录超时，请重试'));
-                }
-            }, 120000);
+            } catch (e) {
+                throw new Error(e.message || '登录请求失败');
+            }
         }
 
         logout() {
@@ -1523,7 +1575,7 @@
                 });
                 this._lastSync = Date.now();
                 
-                // v3.4.1 修复：渐进同步 - 处理服务器截断响应
+                // v3.4.2 修复：渐进同步 - 处理服务器截断响应
                 // 服务器防刷机制会限制单次增量，需要多次同步才能完成大幅增量
                 if (result && result.server_minutes !== undefined) {
                     // 以服务器实际接受的分钟数为准
@@ -2258,7 +2310,7 @@
 #ldsp-panel{transform:translateZ(0);backface-visibility:hidden}
 #ldsp-panel input,#ldsp-panel textarea{cursor:text;user-select:text}
 #ldsp-panel [data-clickable],#ldsp-panel [data-clickable] *,#ldsp-panel button,#ldsp-panel a,#ldsp-panel .ldsp-tab,#ldsp-panel .ldsp-subtab,#ldsp-panel .ldsp-ring-lvl,#ldsp-panel .ldsp-rd-day-bar,#ldsp-panel .ldsp-year-cell:not(.empty),#ldsp-panel .ldsp-rank-item,#ldsp-panel .ldsp-ticket-item,#ldsp-panel .ldsp-ticket-type,#ldsp-panel .ldsp-ticket-tab,#ldsp-panel .ldsp-ticket-close,#ldsp-panel .ldsp-ticket-back,#ldsp-panel .ldsp-lb-refresh,#ldsp-panel .ldsp-modal-btn,#ldsp-panel .ldsp-lb-btn,#ldsp-panel .ldsp-site-icon,#ldsp-panel .ldsp-update-bubble-close{cursor:pointer}
-#ldsp-panel.no-trans,#ldsp-panel.no-trans *{transition:none!important;animation:none!important}
+#ldsp-panel.no-trans,#ldsp-panel.no-trans *{transition:none!important;animation-play-state:paused!important}
 #ldsp-panel.anim{transition:width var(--dur-slow) var(--ease),height var(--dur-slow) var(--ease),left var(--dur-slow) var(--ease),top var(--dur-slow) var(--ease)}
 #ldsp-panel.light{--bg:rgba(250,251,254,.97);--bg-card:rgba(245,247,252,.94);--bg-hover:rgba(238,242,250,.96);--bg-el:rgba(255,255,255,.94);--bg-glass:rgba(0,0,0,.012);--txt:#1e2030;--txt-sec:#4a5068;--txt-mut:#8590a6;--accent:#5070d0;--accent-light:#6b8cef;--accent2:#4a9e8f;--accent2-light:#5bb5a6;--ok:#4a9e8f;--ok-light:#5bb5a6;--ok-bg:rgba(74,158,143,.08);--err:#d45d6e;--err-light:#e07a8d;--err-bg:rgba(212,93,110,.08);--warn:#c49339;--warn-bg:rgba(196,147,57,.08);--border:rgba(0,0,0,.05);--border2:rgba(0,0,0,.08);--border-accent:rgba(80,112,208,.2);--shadow:0 20px 50px rgba(0,0,0,.07),0 0 0 1px rgba(0,0,0,.04);--shadow-lg:0 25px 70px rgba(0,0,0,.1);--glow-accent:0 0 15px rgba(80,112,208,.1)}
 #ldsp-panel.collapsed{width:48px!important;height:48px!important;border-radius:var(--r-md);cursor:pointer;touch-action:none;background:linear-gradient(135deg,#7a9bf5 0%,#5a7de0 50%,#5bb5a6 100%);border:none;box-shadow:var(--shadow),0 0 20px rgba(107,140,239,.35)}
@@ -2275,18 +2327,22 @@
 #ldsp-panel.collapsed:hover{transform:scale(1.08);box-shadow:var(--shadow-lg),0 0 35px rgba(120,160,255,.6)}
 #ldsp-panel.collapsed:hover .ldsp-toggle-logo{filter:brightness(1.6) drop-shadow(0 0 12px rgba(160,200,255,1)) drop-shadow(0 0 20px rgba(140,180,255,.8));transform:scale(1.15) rotate(360deg);transition:filter .3s var(--ease),transform .6s var(--ease-spring)}
 #ldsp-panel.collapsed:active .ldsp-toggle-logo{filter:brightness(2) drop-shadow(0 0 16px rgba(200,230,255,1)) drop-shadow(0 0 30px rgba(160,200,255,1));transform:scale(0.92)}
-.ldsp-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--grad);cursor:move;user-select:none;touch-action:none;position:relative;overflow:hidden}
+.ldsp-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--grad);cursor:move;user-select:none;touch-action:none;position:relative;gap:8px}
 .ldsp-hdr::before{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(255,255,255,.1) 0%,transparent 100%);pointer-events:none}
 .ldsp-hdr::after{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle,rgba(255,255,255,.1) 0%,transparent 60%);opacity:0;transition:opacity .5s;pointer-events:none}
 .ldsp-hdr:hover::after{opacity:1}
-.ldsp-hdr-info{display:flex;align-items:center;gap:10px;min-width:0;position:relative;z-index:1;transition:opacity .25s var(--ease),visibility .25s,transform .25s var(--ease)}
-.ldsp-site-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;flex-shrink:0}
-.ldsp-site-icon{width:28px;height:28px;border-radius:8px;border:2px solid rgba(255,255,255,.25);flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.2);transition:transform .2s var(--ease),border-color .2s;margin-top:-2px}
-.ldsp-site-icon:hover{transform:scale(1.1) rotate(-5deg);border-color:rgba(255,255,255,.5)}
-.ldsp-hdr-text{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0;flex:1;overflow:hidden}
+.ldsp-hdr-info{display:flex;align-items:center;gap:8px;min-width:0;flex:1;position:relative;z-index:1;transition:opacity .25s var(--ease),visibility .25s,transform .25s var(--ease);overflow:hidden}
+.ldsp-site-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;flex-shrink:0;position:relative;padding:2px}
+.ldsp-site-wrap::after{content:'点击退出登录';position:absolute;bottom:-20px;left:50%;transform:translateX(-50%) translateY(4px);background:rgba(0,0,0,.75);color:#fff;padding:3px 8px;border-radius:6px;font-size:8px;white-space:nowrap;opacity:0;pointer-events:none;transition:transform .2s var(--ease),opacity .2s;z-index:10}
+.ldsp-site-wrap:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}
+.ldsp-site-icon{width:28px;height:28px;border-radius:8px;border:2px solid rgba(255,255,255,.25);flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.2);transition:transform .2s var(--ease),border-color .2s}
+.ldsp-site-icon:hover{transform:scale(1.05) rotate(-5deg);border-color:rgba(255,255,255,.5)}
+.ldsp-hdr-text{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0;flex:1 1 0;overflow:hidden}
 .ldsp-title{font-weight:800;font-size:15px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.2;letter-spacing:-.02em;text-shadow:0 1px 2px rgba(0,0,0,.2)}
-.ldsp-ver{font-size:11px;color:rgba(255,255,255,.6);line-height:1.3;display:flex;flex-wrap:wrap;align-items:center;gap:3px 6px}
-.ldsp-app-name{font-size:12px;font-weight:700;background:linear-gradient(90deg,#a8c0f8,#7a9eef,#7cc9bc,#7a9eef,#a8c0f8);background-size:200% auto;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:gradient-shift 6s ease infinite;will-change:background-position}
+.ldsp-ver{font-size:11px;color:rgba(255,255,255,.6);line-height:1.3;display:flex;flex-wrap:nowrap;align-items:center;gap:3px 6px;overflow:hidden;max-width:100%}
+.ldsp-learn-trust{display:block;text-align:center;margin-top:8px;font-size:10px;color:var(--txt-dim);text-decoration:none;opacity:.6;transition:opacity .15s,color .15s}
+.ldsp-learn-trust:hover{opacity:1;color:var(--txt-sec)}
+.ldsp-app-name{font-size:11px;font-weight:700;white-space:nowrap;background:linear-gradient(90deg,#a8c0f8,#7a9eef,#7cc9bc,#7a9eef,#a8c0f8);background-size:200% auto;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:gradient-shift 6s ease infinite;will-change:background-position}
 @keyframes gradient-shift{0%{background-position:0% center}50%{background-position:100% center}100%{background-position:0% center}}
 .ldsp-ver-num{background:rgba(255,255,255,.2);padding:2px 8px;border-radius:10px;color:#fff;font-weight:600;font-size:9px;backdrop-filter:blur(4px)}
 .ldsp-site-ver{font-size:10px;color:#fff;text-align:center;font-weight:700;background:rgba(0,0,0,.25);padding:2px 7px;border-radius:6px;letter-spacing:.02em}
@@ -2637,15 +2693,15 @@
 @media (min-width:1920px){#ldsp-panel{--w:340px;--fs:13px;--pd:16px;--av:50px;--ring:85px}}
 @media (max-height:700px){#ldsp-panel{top:60px}.ldsp-content{max-height:calc(100vh - 240px)}}
 @media (max-width:1200px){#ldsp-panel{right:10px;left:auto}}
-@media (max-width:768px){#ldsp-panel{--w:290px;--fs:12px;--pd:11px;right:8px;left:auto;top:60px}#ldsp-panel.collapsed{width:42px!important;height:42px!important}#ldsp-panel.collapsed .ldsp-toggle{font-size:16px}.ldsp-hdr{padding:8px 10px}.ldsp-site-icon{width:22px;height:22px;border-radius:6px}.ldsp-site-ver{font-size:8px;padding:1px 5px}.ldsp-title{font-size:13px}.ldsp-ver{font-size:9px}.ldsp-hdr-btns{gap:4px}.ldsp-hdr-btns button{width:26px;height:26px;font-size:12px}.ldsp-update-bubble{width:200px;padding:14px 16px}.ldsp-content{max-height:calc(100vh - 240px)}.ldsp-rank-item{padding:10px}.ldsp-rank-num{width:26px;height:26px}.ldsp-rank-avatar{width:30px;height:30px}}
-@media (max-width:480px){#ldsp-panel{--w:270px;--av:36px;--ring:68px;right:6px;left:auto;top:55px;border-radius:var(--r-md);max-height:60vh}#ldsp-panel.collapsed{width:38px!important;height:38px!important;border-radius:10px;max-height:none}#ldsp-panel.collapsed .ldsp-toggle{font-size:14px}.ldsp-hdr{padding:6px 8px}.ldsp-hdr-info{gap:6px}.ldsp-hdr-btns{gap:3px}.ldsp-hdr-btns button{width:24px;height:24px;font-size:11px;border-radius:6px}.ldsp-site-icon{width:20px;height:20px;border-radius:5px}.ldsp-site-ver{font-size:7px;padding:1px 4px}.ldsp-title{font-size:12px}.ldsp-ver{font-size:8px}.ldsp-user{padding:8px;gap:8px}.ldsp-user-actions{gap:4px}.ldsp-action-btn{padding:4px 6px;font-size:9px;flex:0 1 calc(50% - 2px)}.ldsp-action-btn:only-child{flex:0 1 auto}.ldsp-reading{min-width:60px;padding:5px 8px}.ldsp-reading-icon{font-size:16px}.ldsp-reading-time{font-size:10px}.ldsp-reading-label{font-size:7px}.ldsp-tabs{padding:8px 10px;gap:6px}.ldsp-tab{padding:6px 10px;font-size:10px;border-radius:var(--r-sm)}.ldsp-section{padding:8px}.ldsp-content{max-height:calc(60vh - 180px)}.ldsp-rank-item{padding:8px 10px}.ldsp-rank-num{width:24px;height:24px;font-size:10px;border-radius:8px}.ldsp-rank-avatar{width:28px;height:28px;border-radius:8px}.ldsp-rank-display-name,.ldsp-rank-name-only{font-size:11px}.ldsp-rank-time{font-size:12px}.ldsp-my-rank{padding:10px}.ldsp-my-rank-val{font-size:16px}.ldsp-subtab{padding:5px 10px;font-size:9px}}
+@media (max-width:768px){#ldsp-panel{--w:290px;--fs:12px;--pd:11px;right:8px;left:auto;top:60px}#ldsp-panel.collapsed{width:42px!important;height:42px!important}#ldsp-panel.collapsed .ldsp-toggle{font-size:16px}.ldsp-hdr{padding:8px 10px}.ldsp-hdr-info{gap:6px;flex:1;min-width:0;overflow:hidden}.ldsp-hdr-text{gap:1px;min-width:0}.ldsp-site-wrap{padding:1px}.ldsp-site-icon{width:22px;height:22px;border-radius:6px}.ldsp-site-ver{font-size:8px;padding:1px 5px}.ldsp-title{font-size:12px;max-width:100%}.ldsp-ver{font-size:8px}.ldsp-app-name{font-size:10px}.ldsp-hdr-btns{gap:3px;flex-shrink:0}.ldsp-hdr-btns button{width:26px;height:26px;font-size:11px}.ldsp-update-bubble{width:200px;padding:14px 16px}.ldsp-content{max-height:calc(100vh - 240px)}.ldsp-rank-item{padding:10px}.ldsp-rank-num{width:26px;height:26px}.ldsp-rank-avatar{width:30px;height:30px}.ldsp-learn-trust{font-size:9px}}
+@media (max-width:480px){#ldsp-panel{--w:270px;--av:36px;--ring:68px;right:6px;left:auto;top:55px;border-radius:var(--r-md);max-height:60vh}#ldsp-panel.collapsed{width:38px!important;height:38px!important;border-radius:10px;max-height:none}#ldsp-panel.collapsed .ldsp-toggle{font-size:14px}.ldsp-hdr{padding:6px 8px;gap:4px}.ldsp-hdr-info{gap:4px;min-width:0;overflow:hidden}.ldsp-hdr-text{gap:0;min-width:0}.ldsp-site-wrap{padding:1px}.ldsp-site-icon{width:18px;height:18px;border-radius:5px}.ldsp-site-ver{font-size:7px;padding:1px 4px}.ldsp-site-wrap::after{display:none}.ldsp-title{font-size:10px}.ldsp-ver{font-size:7px}.ldsp-app-name{font-size:8px}.ldsp-hdr-btns{gap:2px}.ldsp-hdr-btns button{width:22px;height:22px;font-size:10px;border-radius:5px}.ldsp-user{padding:8px;gap:8px}.ldsp-user-actions{gap:4px}.ldsp-action-btn{padding:4px 6px;font-size:9px;flex:0 1 calc(50% - 2px)}.ldsp-action-btn:only-child{flex:0 1 auto}.ldsp-reading{min-width:60px;padding:5px 8px}.ldsp-reading-icon{font-size:16px}.ldsp-reading-time{font-size:10px}.ldsp-reading-label{font-size:7px}.ldsp-tabs{padding:8px 10px;gap:6px}.ldsp-tab{padding:6px 10px;font-size:10px;border-radius:var(--r-sm)}.ldsp-section{padding:8px}.ldsp-content{max-height:calc(60vh - 180px)}.ldsp-rank-item{padding:8px 10px}.ldsp-rank-num{width:24px;height:24px;font-size:10px;border-radius:8px}.ldsp-rank-avatar{width:28px;height:28px;border-radius:8px}.ldsp-rank-display-name,.ldsp-rank-name-only{font-size:11px}.ldsp-rank-time{font-size:12px}.ldsp-my-rank{padding:10px}.ldsp-my-rank-val{font-size:16px}.ldsp-subtab{padding:5px 10px;font-size:9px}.ldsp-learn-trust{font-size:8px}}
 @media (max-height:500px){#ldsp-panel{top:40px}.ldsp-content{max-height:calc(100vh - 180px)}.ldsp-user{padding:8px}.ldsp-user-actions{display:none}.ldsp-tabs{padding:6px 8px}.ldsp-section{padding:6px}}
 .ldsp-action-btn{display:inline-flex;align-items:center;gap:4px;padding:5px 10px;background:linear-gradient(135deg,rgba(107,140,239,.08),rgba(90,125,224,.12));border:1px solid rgba(107,140,239,.2);border-radius:8px;font-size:10px;color:var(--accent);transition:background .15s,border-color .15s,transform .2s var(--ease);font-weight:600;white-space:nowrap;flex:0 1 calc(50% - 3px);min-width:60px;justify-content:center}
 .ldsp-action-btn:hover{background:linear-gradient(135deg,rgba(107,140,239,.15),rgba(90,125,224,.2));border-color:var(--accent);box-shadow:0 4px 12px rgba(107,140,239,.18)}
 .ldsp-action-btn:only-child{flex:0 1 auto}
 .ldsp-action-btn .ldsp-action-icon{flex-shrink:0}
 .ldsp-action-btn .ldsp-action-text{overflow:hidden;text-overflow:ellipsis}
-@media (max-width:320px){.ldsp-user-actions{flex-direction:column}.ldsp-action-btn{flex:1 1 100%;min-width:0}}
+@media (max-width:320px){.ldsp-hdr{padding:5px 6px;gap:3px}.ldsp-hdr-info{gap:3px}.ldsp-site-icon{width:16px;height:16px;border-radius:4px}.ldsp-site-ver{display:none}.ldsp-title{font-size:9px}.ldsp-app-name{display:none}.ldsp-hdr-btns button{width:20px;height:20px;font-size:9px}.ldsp-user-actions{flex-direction:column}.ldsp-action-btn{flex:1 1 100%;min-width:0}}
 .ldsp-ticket-btn{}
 .ldsp-ticket-btn .ldsp-ticket-badge{background:var(--err);color:#fff;font-size:8px;padding:2px 5px;border-radius:8px;margin-left:2px;font-weight:700;animation:pulse 3s ease infinite}
 .ldsp-ticket-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:var(--bg);border-radius:0 0 var(--r-lg) var(--r-lg);z-index:10;display:none;flex-direction:column;overflow:hidden}
@@ -3273,6 +3329,9 @@
                 </div>`);
                 this.prevValues.set(r.name, r.currentValue);
             }
+
+            // 添加底部了解信任等级的提示链接
+            htmlParts.push(`<a class="ldsp-learn-trust" href="https://linux.do/t/topic/2460" target="_blank" rel="noopener">了解论坛信任等级 →</a>`);
 
             this.panel.$.reqs.innerHTML = htmlParts.join('');
             
@@ -3928,6 +3987,13 @@
                 this.ticketManager.init().catch(e => console.warn('[TicketManager] Init error:', e));
             }
 
+            // 检查待处理的 OAuth 登录结果（统一同窗口模式）
+            // 返回 true 表示刚完成登录，已经触发了云同步，不需要再重复
+            let justLoggedIn = false;
+            if (this.hasLeaderboard && this.oauth) {
+                justLoggedIn = this._checkPendingOAuthLogin();
+            }
+
             // 云同步初始化
             if (this.hasLeaderboard) {
                 // 注册同步状态回调，更新顶部按钮状态
@@ -3939,7 +4005,8 @@
                     }
                 });
 
-                if (this.oauth.isLoggedIn()) {
+                if (this.oauth.isLoggedIn() && !justLoggedIn) {
+                    // 已登录用户（非刚登录）：进行常规同步
                     // 确保 storage 使用正确的用户名（从 OAuth 用户信息同步）
                     const oauthUser = this.oauth.getUserInfo();
                     if (oauthUser?.username) {
@@ -3960,7 +4027,11 @@
                     this._syncPrefs();
                     if (this.oauth.isJoined()) this.leaderboard.startSync();
                     this._updateLoginUI();
+                } else if (justLoggedIn) {
+                    // 刚完成登录：_handlePendingLoginResult 已处理同步和 UI 更新
+                    if (this.oauth.isJoined()) this.leaderboard.startSync();
                 } else {
+                    // 未登录：显示登录提示
                     this._checkLoginPrompt();
                 }
             }
@@ -4156,6 +4227,24 @@
             this.$.user.addEventListener('click', e => {
                 if (e.target.closest('.ldsp-avatar-wrap')) {
                     window.open('https://github.com/caigg188/LDStatusPro', '_blank');
+                }
+            });
+            
+            // 点击 site-icon 退出登录
+            this.$.siteIcon = this.el.querySelector('.ldsp-site-icon');
+            this.$.siteIcon?.addEventListener('click', e => {
+                e.stopPropagation();
+                if (!this.hasLeaderboard || !this.oauth?.isLoggedIn()) {
+                    this.renderer.showToast('ℹ️ 当前未登录');
+                    return;
+                }
+                // 确认退出
+                if (confirm('确定要退出登录吗？\n退出后排行榜和云同步功能将不可用')) {
+                    this.oauth.logout();
+                    this.leaderboard?.stopSync();
+                    this.renderer.showToast('✅ 已退出登录');
+                    this._updateLoginUI();
+                    this._renderLeaderboard();
                 }
             });
             
@@ -5189,22 +5278,69 @@
             this.$.userDisplayName.addEventListener('click', handle);
         }
 
-        async _doLogin() {
+        /**
+         * 检查并处理待处理的 OAuth 登录结果
+         * 统一同窗口登录模式：用户授权后会跳转回原页面，登录结果通过 URL hash 传递
+         * 数据在脚本最开始就被捕获到 _pendingOAuthData 全局变量
+         */
+        _checkPendingOAuthLogin() {
+            console.log('[OAuth] _checkPendingOAuthLogin called, _pendingOAuthData:', _pendingOAuthData ? 'present' : 'null');
+            // 优先使用脚本启动时捕获的数据（避免 Discourse 路由处理掉 hash）
+            let pendingResult = _pendingOAuthData;
+            _pendingOAuthData = null; // 清除已使用的数据
+            
+            // 备用：再次尝试从 URL hash 读取
+            if (!pendingResult) {
+                console.log('[OAuth] No early captured data, trying URL hash fallback...');
+                pendingResult = this.oauth._checkUrlHashLogin();
+            }
+            
+            console.log('[OAuth] pendingResult:', pendingResult ? { success: pendingResult.success, hasToken: !!pendingResult.token, hasUser: !!pendingResult.user } : 'null');
+            
+            if (pendingResult?.success && pendingResult.token && pendingResult.user) {
+                console.log('[OAuth] ✅ Processing login result for user:', pendingResult.user?.username);
+                // 【关键】先同步保存登录信息，确保后续的 isLoggedIn() 检查能返回 true
+                this.oauth.setToken(pendingResult.token);
+                this.oauth.setUserInfo(pendingResult.user);
+                this.oauth.setJoined(pendingResult.isJoined || false);
+                // 处理登录结果（异步操作如同步、UI更新等）
+                this._handlePendingLoginResult(pendingResult);
+                return true; // 返回 true 表示有登录结果被处理
+            } else {
+                console.log('[OAuth] No valid pending login result');
+                return false;
+            }
+        }
+
+        // 处理待处理的登录结果（登录信息已在 _checkPendingOAuthLogin 中同步保存）
+        async _handlePendingLoginResult(result) {
             try {
-                this.renderer.showToast('⏳ 正在打开登录窗口...');
-                const user = await this.oauth.login();
                 this.renderer.showToast('✅ 登录成功');
-                // 同步用户名到 storage，确保云同步使用正确的用户键
-                if (user?.username) {
-                    this.storage.setUser(user.username);
-                    this.storage.invalidateCache();  // 清除缓存确保使用新 key
-                    this.storage.migrate(user.username);
-                    // 使用 OAuth 用户信息更新界面
-                    this._updateUserInfoFromOAuth(user);
+                
+                // 同步用户名到 storage
+                if (result.user?.username) {
+                    this.storage.setUser(result.user.username);
+                    this.storage.invalidateCache();
+                    this.storage.migrate(result.user.username);
+                    this._updateUserInfoFromOAuth(result.user);
                 }
+                
                 this._updateLoginUI();
                 await this._syncPrefs();
                 this.cloudSync.fullSync().catch(e => console.warn('[CloudSync]', e));
+            } catch (e) {
+                console.error('[OAuth] Handle pending login error:', e);
+            }
+        }
+
+        async _doLogin() {
+            try {
+                this.renderer.showToast('⏳ 正在跳转到授权页面...');
+                // 统一同窗口登录：login() 会跳转页面，不会返回
+                // 登录成功后页面会跳转回来，由 _checkPendingOAuthLogin 处理结果
+                await this.oauth.login();
+                // 如果 login() 返回了用户（从 localStorage 读取的待处理结果），处理它
+                // 注意：正常情况下不会执行到这里，因为页面会跳转
             } catch (e) {
                 this.renderer.showToast(`❌ ${e.message}`);
             }
@@ -5258,20 +5394,12 @@
             const loginBtn = overlay.querySelector('#ldsp-modal-login');
             loginBtn?.addEventListener('click', async () => {
                 loginBtn.disabled = true;
-                loginBtn.textContent = '⏳ 登录中...';
+                loginBtn.textContent = '⏳ 跳转中...';
                 try {
-                    const user = await this.oauth.login();
-                    this.renderer.showToast('✅ 登录成功');
-                    // 同步用户名到 storage，确保云同步使用正确的用户键
-                    if (user?.username) {
-                        this.storage.setUser(user.username);
-                        this.storage.invalidateCache();  // 清除缓存确保使用新 key
-                        this.storage.migrate(user.username);
-                    }
-                    close(false);
-                    this._updateLoginUI();
-                    await this._syncPrefs();
-                    this.cloudSync.fullSync().catch(e => console.warn('[CloudSync]', e));
+                    // 统一同窗口登录：会跳转到授权页面
+                    // 登录成功后返回此页面，由 _checkPendingOAuthLogin 处理
+                    await this.oauth.login();
+                    // 正常情况下不会执行到这里，因为页面会跳转
                 } catch (e) {
                     this.renderer.showToast(`❌ ${e.message}`);
                     loginBtn.disabled = false;
@@ -5334,14 +5462,11 @@
                 if (loginBtn) {
                     loginBtn.onclick = async () => {
                         loginBtn.disabled = true;
-                        loginBtn.textContent = '⏳ 登录中...';
+                        loginBtn.textContent = '⏳ 跳转中...';
                         try {
+                            // 统一同窗口登录：会跳转到授权页面
                             await this.oauth.login();
-                            this.renderer.showToast('✅ 登录成功');
-                            this._updateLoginUI();
-                            await this._syncPrefs();
-                            this.cloudSync.fullSync().catch(e => console.warn('[CloudSync]', e));
-                            await this._renderLeaderboardContent();
+                            // 正常情况下不会执行到这里，因为页面会跳转
                         } catch (e) {
                             this.renderer.showToast(`❌ ${e.message}`);
                             loginBtn.disabled = false;
