@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         LDStatus Pro
 // @namespace    http://tampermonkey.net/
-// @version      3.4.8.3
+// @version      3.4.8.5
 // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计、排行榜系统。两站点均支持排行榜和云同步功能
 // @author       JackLiii
 // @license      MIT
@@ -108,6 +108,163 @@
         console.warn('[LDStatus Pro] 不支持的网站');
         return;
     }
+
+    // ==================== 事件总线（跨模块通信） ====================
+    const EventBus = {
+        _listeners: new Map(),
+        
+        // 订阅事件
+        on(event, callback) {
+            if (!this._listeners.has(event)) {
+                this._listeners.set(event, new Set());
+            }
+            this._listeners.get(event).add(callback);
+            // 返回取消订阅函数
+            return () => this.off(event, callback);
+        },
+        
+        // 取消订阅
+        off(event, callback) {
+            this._listeners.get(event)?.delete(callback);
+        },
+        
+        // 发布事件
+        emit(event, data) {
+            this._listeners.get(event)?.forEach(cb => {
+                try { cb(data); } catch (e) { /* 静默失败 */ }
+            });
+        },
+        
+        // 一次性订阅
+        once(event, callback) {
+            const wrapper = (data) => {
+                this.off(event, wrapper);
+                callback(data);
+            };
+            return this.on(event, wrapper);
+        },
+        
+        // 清理所有监听器
+        clear() {
+            this._listeners.clear();
+        }
+    };
+
+    // ==================== 跨标签页领导者管理器（全局单例） ====================
+    // 确保同一时间只有一个标签页执行定时任务（阅读计时、同步、刷新等）
+    const TabLeader = {
+        LEADER_KEY: `ldsp_tab_leader_${CURRENT_SITE.prefix}`,
+        HEARTBEAT: 5000,    // 5秒心跳
+        TIMEOUT: 15000,     // 15秒超时
+        _tabId: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+        _isLeader: false,
+        _initialized: false,
+        _interval: null,
+        _callbacks: [],     // 领导者状态变化回调
+        
+        init() {
+            if (this._initialized) return;
+            this._initialized = true;
+            
+            this._tryBecomeLeader();
+            this._interval = setInterval(() => this._tryBecomeLeader(), this.HEARTBEAT);
+            
+            // 监听其他标签页的变化
+            this._storageHandler = (e) => {
+                if (e.key === this.LEADER_KEY) this._tryBecomeLeader();
+            };
+            window.addEventListener('storage', this._storageHandler);
+            
+            // 页面卸载时释放领导者
+            this._unloadHandler = () => this._release();
+            window.addEventListener('beforeunload', this._unloadHandler);
+        },
+        
+        _tryBecomeLeader() {
+            const now = Date.now();
+            let data = {};
+            try {
+                const stored = localStorage.getItem(this.LEADER_KEY);
+                if (stored) data = JSON.parse(stored);
+            } catch (e) { /* 解析失败视为无数据 */ }
+            
+            const expired = !data.timestamp || (now - data.timestamp) > this.TIMEOUT;
+            const iAmLeader = data.tabId === this._tabId;
+            
+            if (expired || iAmLeader) {
+                const wasLeader = this._isLeader;
+                this._isLeader = true;
+                try {
+                    localStorage.setItem(this.LEADER_KEY, JSON.stringify({
+                        tabId: this._tabId,
+                        timestamp: now
+                    }));
+                } catch (e) { /* 存储失败不影响逻辑 */ }
+                if (!wasLeader) {
+                    this._notifyCallbacks(true);
+                    EventBus.emit('leader:change', { isLeader: true, tabId: this._tabId });
+                }
+            } else if (this._isLeader) {
+                this._isLeader = false;
+                this._notifyCallbacks(false);
+                EventBus.emit('leader:change', { isLeader: false, tabId: this._tabId });
+            }
+        },
+        
+        _release() {
+            if (this._isLeader) {
+                try {
+                    const stored = localStorage.getItem(this.LEADER_KEY);
+                    if (stored) {
+                        const data = JSON.parse(stored);
+                        if (data.tabId === this._tabId) {
+                            localStorage.removeItem(this.LEADER_KEY);
+                        }
+                    }
+                } catch (e) { /* 静默失败 */ }
+            }
+        },
+        
+        _notifyCallbacks(isLeader) {
+            this._callbacks.forEach(cb => {
+                try { cb(isLeader); } catch (e) { /* 静默失败 */ }
+            });
+        },
+        
+        // 公开方法：检查是否是领导者
+        isLeader() {
+            return this._isLeader;
+        },
+        
+        // 公开方法：获取当前标签页 ID
+        getTabId() {
+            return this._tabId;
+        },
+        
+        // 公开方法：注册领导者状态变化回调
+        onLeaderChange(callback) {
+            if (typeof callback === 'function') {
+                this._callbacks.push(callback);
+            }
+        },
+        
+        // 公开方法：销毁
+        destroy() {
+            if (this._interval) {
+                clearInterval(this._interval);
+                this._interval = null;
+            }
+            if (this._storageHandler) {
+                window.removeEventListener('storage', this._storageHandler);
+            }
+            if (this._unloadHandler) {
+                window.removeEventListener('beforeunload', this._unloadHandler);
+            }
+            this._release();
+            this._callbacks = [];
+            this._initialized = false;
+        }
+    };
 
     // ==================== 常量配置 ====================
     const CONFIG = {
@@ -233,26 +390,75 @@
         NUMBER: /(\d+)/
     };
 
+    // ==================== 调试与日志 ====================
+    const Logger = {
+        _enabled: false,  // 生产环境默认关闭详细日志
+        _prefix: '[LDSP]',
+        
+        enable() { this._enabled = true; },
+        disable() { this._enabled = false; },
+        
+        log(...args) {
+            if (this._enabled) console.log(this._prefix, ...args);
+        },
+        warn(...args) {
+            console.warn(this._prefix, ...args);
+        },
+        error(...args) {
+            console.error(this._prefix, ...args);
+        },
+        // 带标签的日志（用于追踪特定模块）
+        tag(tag) {
+            return {
+                log: (...args) => this._enabled && console.log(`${this._prefix}[${tag}]`, ...args),
+                warn: (...args) => console.warn(`${this._prefix}[${tag}]`, ...args),
+                error: (...args) => console.error(`${this._prefix}[${tag}]`, ...args)
+            };
+        }
+    };
+
     // ==================== 工具函数 ====================
     const Utils = {
         _nameCache: new Map(),
+        _htmlEntities: { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' },
 
         // HTML 转义（防止 XSS）
         escapeHtml(str) {
             if (!str || typeof str !== 'string') return '';
-            const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' };
-            return str.replace(/[&<>"']/g, c => entities[c]);
+            return str.replace(/[&<>"']/g, c => this._htmlEntities[c]);
         },
 
-        // 清理用户输入
+        // 清理用户输入（移除控制字符，限制长度）
         sanitize(str, maxLen = 100) {
             if (!str || typeof str !== 'string') return '';
             return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').substring(0, maxLen).trim();
         },
+        
+        // 安全的数值转换（防止 NaN 和 Infinity）
+        toSafeNumber(val, defaultVal = 0) {
+            const num = Number(val);
+            return Number.isFinite(num) ? num : defaultVal;
+        },
+        
+        // 安全的整数转换
+        toSafeInt(val, defaultVal = 0) {
+            const num = parseInt(val, 10);
+            return Number.isFinite(num) ? num : defaultVal;
+        },
+        
+        // 深度冻结对象（防止意外修改）
+        deepFreeze(obj) {
+            if (obj && typeof obj === 'object') {
+                Object.keys(obj).forEach(key => this.deepFreeze(obj[key]));
+                return Object.freeze(obj);
+            }
+            return obj;
+        },
 
         // 版本比较
         compareVersion(v1, v2) {
-            const [p1, p2] = [v1, v2].map(v => v.split('.').map(Number));
+            if (!v1 || !v2) return 0;
+            const [p1, p2] = [v1, v2].map(v => String(v).split('.').map(n => this.toSafeInt(n)));
             const len = Math.max(p1.length, p2.length);
             for (let i = 0; i < len; i++) {
                 const diff = (p1[i] || 0) - (p2[i] || 0);
@@ -388,6 +594,50 @@
             } catch (e) {
                 return fallback;
             }
+        },
+        
+        // 安全的异步执行（捕获 Promise 异常）
+        async safeAsync(fn, fallback = null) {
+            try {
+                return await fn();
+            } catch (e) {
+                Logger.warn('Async operation failed:', e.message);
+                return fallback;
+            }
+        },
+        
+        // 生成唯一 ID
+        uid() {
+            return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        },
+        
+        // 检查是否为有效的 URL
+        isValidUrl(str) {
+            if (!str || typeof str !== 'string') return false;
+            try {
+                const url = new URL(str);
+                return url.protocol === 'http:' || url.protocol === 'https:';
+            } catch {
+                return false;
+            }
+        },
+        
+        // 安全获取嵌套对象属性
+        get(obj, path, defaultVal = undefined) {
+            if (!obj || typeof path !== 'string') return defaultVal;
+            const keys = path.split('.');
+            let result = obj;
+            for (const key of keys) {
+                if (result == null || typeof result !== 'object') return defaultVal;
+                result = result[key];
+            }
+            return result !== undefined ? result : defaultVal;
+        },
+        
+        // 克隆对象（浅拷贝，用于配置等）
+        clone(obj) {
+            if (!obj || typeof obj !== 'object') return obj;
+            return Array.isArray(obj) ? [...obj] : { ...obj };
         }
     };
 
@@ -630,12 +880,32 @@
         }
     }
 
+    // ==================== 自定义错误类型 ====================
+    class NetworkError extends Error {
+        constructor(message, code = 'NETWORK_ERROR', status = 0) {
+            super(message);
+            this.name = 'NetworkError';
+            this.code = code;
+            this.status = status;
+        }
+        
+        get isTimeout() { return this.code === 'TIMEOUT'; }
+        get isAuth() { return this.code === 'UNAUTHORIZED' || this.status === 401; }
+        get isNotFound() { return this.status === 404; }
+        get isServerError() { return this.status >= 500; }
+    }
+
     // ==================== 网络管理器 ====================
     class Network {
         constructor() {
             this._pending = new Map();
             this._apiCache = new Map();
             this._apiCacheTime = new Map();
+        }
+        
+        // 创建统一的错误对象
+        static createError(message, code = 'UNKNOWN', status = 0) {
+            return new NetworkError(message, code, status);
         }
 
         // 静态方法：加载阅读等级配置（从服务端获取，本地缓存24小时）
@@ -1047,8 +1317,30 @@
             if (this._initialized) return;
             this.storage.migrate(username);
             this._bindEvents();
-            this._startTracking();
+            
+            // 使用全局 TabLeader 管理领导者状态
+            // 只有领导者才启动计时，避免多标签页重复计时
+            if (TabLeader.isLeader()) {
+                this._startTracking();
+            }
+            
+            // 监听领导者状态变化
+            TabLeader.onLeaderChange((isLeader) => {
+                if (isLeader) {
+                    this._startTracking();
+                } else {
+                    this._stopTracking();
+                }
+            });
+            
             this._initialized = true;
+        }
+        
+        _stopTracking() {
+            this._intervals.forEach(id => clearInterval(id));
+            this._intervals = [];
+            // 停止前保存当前数据
+            this.save();
         }
 
         _bindEvents() {
@@ -1238,13 +1530,13 @@
             });
             return total;
         }
-
+        
         destroy() {
-            // 清除定时器
+            // 清除计时定时器
             this._intervals.forEach(id => clearInterval(id));
             this._intervals = [];
             
-            // 移除事件监听器（提高内存效率）
+            // 移除事件监听器
             if (this._activityHandler) {
                 ['mousedown', 'keydown', 'scroll', 'touchstart'].forEach(e => {
                     document.removeEventListener(e, this._activityHandler, { passive: true, capture: false });
@@ -1338,7 +1630,7 @@
             
             // 检查 token 是否过期
             if (this._isTokenExpired(token)) {
-                console.log('[LDStatus Pro] Token expired, logging out');
+                Logger.log('Token expired, logging out');
                 this.logout();
                 return false;
             }
@@ -1479,20 +1771,32 @@
 
         /**
          * 发起 API 请求，自动处理 Token 过期
+         * @param {string} endpoint - API 端点
+         * @param {Object} options - 请求选项
+         * @param {boolean} options.requireAuth - 是否需要登录（默认 true）
          */
         async api(endpoint, options = {}) {
+            const { requireAuth = true, ...restOptions } = options;
+            
+            // 需要登录的接口，先检查登录状态
+            if (requireAuth && !this.isLoggedIn()) {
+                throw Network.createError('Not logged in', 'NOT_LOGGED_IN');
+            }
+            
             try {
-                const result = await this.network.api(endpoint, { ...options, token: this.getToken() });
+                const result = await this.network.api(endpoint, { ...restOptions, token: this.getToken() });
                 return result;
             } catch (e) {
                 // 检查是否是 Token 过期错误
-                if (e.message?.includes('expired') || e.message?.includes('TOKEN_EXPIRED') || 
-                    e.message?.includes('INVALID_TOKEN') || e.message?.includes('401') ||
-                    e.message?.includes('Unauthorized')) {
-                    console.log('[LDStatus Pro] Token expired or invalid, logging out');
+                const errMsg = e.message || '';
+                const isAuthError = errMsg.includes('expired') || errMsg.includes('TOKEN_EXPIRED') || 
+                    errMsg.includes('INVALID_TOKEN') || errMsg.includes('401') ||
+                    errMsg.includes('Unauthorized') || (e instanceof NetworkError && e.isAuth);
+                
+                if (isAuthError) {
                     this.logout();
-                    // 触发 UI 更新事件
-                    window.dispatchEvent(new CustomEvent('ldsp_token_expired'));
+                    // 通过事件总线通知（替代全局 window 事件）
+                    EventBus.emit('auth:expired', { endpoint });
                 }
                 throw e;
             }
@@ -1608,6 +1912,8 @@
 
         async syncReadingTime() {
             if (!this.oauth.isLoggedIn() || !this.oauth.isJoined()) return;
+            // 只有领导者标签页才执行同步，避免多标签页重复请求
+            if (!TabLeader.isLeader()) return;
             if (Date.now() - this._lastSync < 60000) return;
 
             try {
@@ -1643,7 +1949,7 @@
                     
                     if (result.truncated && serverAccepted < currentMinutes) {
                         // 服务器截断了数据，需要继续同步
-                        console.log(`[Leaderboard] Sync truncated: server=${serverAccepted}, client=${currentMinutes}, will retry`);
+                        Logger.log(`Leaderboard sync truncated: server=${serverAccepted}, client=${currentMinutes}, will retry`);
                         // 35秒后再次尝试同步剩余数据（服务器限制是30秒）
                         setTimeout(() => {
                             this._lastSync = 0; // 重置冷却时间
@@ -1651,7 +1957,7 @@
                         }, 35000);
                     } else if (result.rateLimited) {
                         // 被服务器限速，稍后重试
-                        console.log(`[Leaderboard] Rate limited, will retry later`);
+                        Logger.log('Leaderboard rate limited, will retry later');
                         setTimeout(() => {
                             this._lastSync = 0;
                             this.syncReadingTime();
@@ -1977,6 +2283,8 @@
             if (this._timer) return;
             this._timer = setInterval(async () => {
                 if (!this.oauth.isLoggedIn()) return;
+                // 只有领导者标签页才执行定期同步，避免多标签页重复请求
+                if (!TabLeader.isLeader()) return;
                 if (this._syncing) return; // 避免并发
 
                 const now = Date.now();
@@ -2563,13 +2871,12 @@
 .ldsp-chg-val.up{background:var(--ok-bg);color:var(--ok)}
 .ldsp-chg-val.down{background:var(--err-bg);color:var(--err)}
 .ldsp-chg-val.neu{background:var(--bg-el);color:var(--txt-mut)}
-.ldsp-rd-stats{background:var(--bg-card);border-radius:var(--r-md);padding:14px;margin-bottom:10px;display:flex;align-items:center;gap:12px;border:1px solid var(--border);position:relative;overflow:hidden}
-.ldsp-rd-stats::before{content:'';position:absolute;right:-20px;top:-20px;width:80px;height:80px;background:radial-gradient(circle,var(--accent) 0%,transparent 70%);opacity:.08;pointer-events:none}
+.ldsp-rd-stats{border-radius:var(--r-md);padding:14px;margin-bottom:10px;display:flex;align-items:center;gap:12px;border:1px solid var(--border)}
 .ldsp-rd-stats-icon{font-size:32px;flex-shrink:0;filter:drop-shadow(0 2px 8px rgba(0,0,0,.2))}
 .ldsp-rd-stats-info{flex:1}
 .ldsp-rd-stats-val{font-size:18px;font-weight:800;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-.02em}
 .ldsp-rd-stats-lbl{font-size:10px;color:var(--txt-mut);margin-top:3px;font-weight:500}
-.ldsp-rd-stats-badge{padding:4px 10px;border-radius:12px;font-size:10px;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+.ldsp-rd-stats-badge{padding:5px 12px;border-radius:12px;font-size:10px;font-weight:700;transform:translateY(-1px);transition:transform .15s,box-shadow .15s}
 .ldsp-track{display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg-card);border-radius:var(--r-sm);margin-bottom:10px;font-size:10px;color:var(--txt-mut);border:1px solid var(--border);font-weight:500}
 .ldsp-track-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 3s ease-in-out infinite;box-shadow:0 0 10px rgba(16,185,129,.4);will-change:opacity,transform}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1);box-shadow:0 0 10px rgba(16,185,129,.4)}50%{opacity:.7;transform:scale(.9);box-shadow:0 0 5px rgba(16,185,129,.2)}}
@@ -2833,6 +3140,10 @@
 
     // ==================== 工单管理器 ====================
     class TicketManager {
+        // 跨标签页共享的缓存 key
+        static CACHE_KEY = 'ldsp_ticket_unread';
+        static CACHE_TTL = 30 * 1000;  // 30 秒缓存有效期
+        
         constructor(oauth, panelBody) {
             this.oauth = oauth;
             this.panelBody = panelBody;
@@ -2844,7 +3155,6 @@
             this.unreadCount = 0;
             this._pollTimer = null;
             this._isOverlayOpen = false;  // 工单面板是否打开
-            this._lastCheck = 0;  // 上次检查时间（用于防抖）
         }
 
         async init() {
@@ -2940,21 +3250,41 @@
             }
         }
 
-        // 检查未读工单数（触发式调用，非轮询）
-        async _checkUnread() {
+        // 检查未读工单数（触发式调用，支持跨标签页缓存）
+        async _checkUnread(forceRefresh = false) {
+            // 1. 检查登录状态
             if (!this.oauth?.isLoggedIn()) return;
-            // 防抖保护：至少间隔3秒才允许下一次检查
+            
             const now = Date.now();
-            if (now - this._lastCheck < 3000) return;
-            this._lastCheck = now;
+            
+            // 2. 检查跨标签页共享缓存（除非强制刷新）
+            if (!forceRefresh) {
+                try {
+                    const cached = GM_getValue(TicketManager.CACHE_KEY, null);
+                    if (cached && (now - cached.time) < TicketManager.CACHE_TTL) {
+                        // 使用缓存数据更新徽章
+                        this.unreadCount = cached.count || 0;
+                        this._updateBadge();
+                        return;
+                    }
+                } catch (e) { /* 缓存读取失败，继续请求 */ }
+            }
+            
+            // 3. 发起请求
             try {
                 const result = await this.oauth.api('/api/tickets/unread/count');
                 const data = result.data?.data || result.data;
                 if (result.success) {
                     this.unreadCount = data?.count || 0;
                     this._updateBadge();
+                    // 更新跨标签页缓存
+                    try {
+                        GM_setValue(TicketManager.CACHE_KEY, { count: this.unreadCount, time: now });
+                    } catch (e) { /* 缓存写入失败，忽略 */ }
                 }
-            } catch (e) {}
+            } catch (e) {
+                // 静默失败（未登录等情况）
+            }
         }
 
         _updateBadge() {
@@ -2992,7 +3322,7 @@
             }
             // 工单面板打开时立即检查一次并启动轮询（仅在页面可见时）
             if (!document.hidden) {
-                this._checkUnread();
+                this._checkUnread(true);  // 强制刷新，忽略缓存
                 this._startUnreadPoll();
             }
         }
@@ -3012,12 +3342,13 @@
         }
 
         hide() {
+            // 先停止轮询，确保不会有遗留的定时器
+            this._stopUnreadPoll();
+            this._isOverlayOpen = false;
+            
             this.overlay.classList.remove('show');
             this.currentView = 'list';
             this.currentTicket = null;
-            this._isOverlayOpen = false;
-            // 工单面板关闭时停止轮询
-            this._stopUnreadPoll();
             this.overlay.querySelectorAll('.ldsp-ticket-tab').forEach(t => t.classList.remove('active'));
             this.overlay.querySelector('.ldsp-ticket-tab[data-tab="list"]')?.classList.add('active');
         }
@@ -3558,10 +3889,10 @@
             // 阅读时间基础信息（所有用户都可见）
             let html = `
                 <div class="ldsp-time-info">今日 00:00 ~ ${nowStr} (首次记录于 ${startStr})</div>
-                <div class="ldsp-rd-stats">
+                <div class="ldsp-rd-stats" style="background:${lv.bg.replace('0.15', '0.08')}">
                     <div class="ldsp-rd-stats-icon">${lv.icon}</div>
                     <div class="ldsp-rd-stats-info"><div class="ldsp-rd-stats-val">${Utils.formatReadingTime(readingTime)}</div><div class="ldsp-rd-stats-lbl">今日累计阅读</div></div>
-                    <div class="ldsp-rd-stats-badge" style="background:${lv.bg};color:${lv.color}">${lv.label}</div>
+                    <div class="ldsp-rd-stats-badge" style="background:${lv.bg};color:${lv.color};box-shadow:0 3px 12px ${lv.bg.replace('0.15','0.4')},inset 0 1px 0 rgba(255,255,255,.25)">${lv.label}</div>
                 </div>
                 <div class="ldsp-rd-prog">
                     <div class="ldsp-rd-prog-hdr"><span class="ldsp-rd-prog-title">📖 阅读目标 (10小时)</span><span class="ldsp-rd-prog-val">${Math.round(pct)}%</span></div>
@@ -3710,10 +4041,10 @@
             let html = `<div class="ldsp-time-info">共记录 <span>${actualReadingDays}</span> 天阅读数据</div>`;
 
             if (total > 0) {
-                html += `<div class="ldsp-rd-stats">
-                    <div class="ldsp-rd-stats-icon">📚</div>
+                html += `<div class="ldsp-rd-stats" style="background:${lv.bg.replace('0.15', '0.08')}">
+                    <div class="ldsp-rd-stats-icon">${lv.icon}</div>
                     <div class="ldsp-rd-stats-info"><div class="ldsp-rd-stats-val">${Utils.formatReadingTime(total)}</div><div class="ldsp-rd-stats-lbl">累计阅读时间 · 日均 ${Utils.formatReadingTime(avg)}</div></div>
-                    <div class="ldsp-rd-stats-badge" style="background:${lv.bg};color:${lv.color}">${lv.label}</div>
+                    <div class="ldsp-rd-stats-badge" style="background:${lv.bg};color:${lv.color};box-shadow:0 3px 12px ${lv.bg.replace('0.15','0.4')},inset 0 1px 0 rgba(255,255,255,.25)">${lv.label}</div>
                 </div>`;
             }
 
@@ -4058,27 +4389,39 @@
     // ==================== 主面板类 ====================
     class Panel {
         constructor() {
-            // 初始化管理器
+            this._initManagers();
+            this._initState();
+            this._initUI();
+            this._initCloudServices();
+            this._initEventListeners();
+            this._initTimers();
+        }
+        
+        // 初始化管理器实例
+        _initManagers() {
             this.storage = new Storage();
             this.network = new Network();
             this.historyMgr = new HistoryManager(this.storage);
             this.tracker = new ReadingTracker(this.storage);
             this.notifier = new Notifier(this.storage);
 
-            // 排行榜相关（仅 linux.do）
+            // 排行榜相关（仅支持的站点）
             this.hasLeaderboard = CURRENT_SITE.supportsLeaderboard;
             if (this.hasLeaderboard) {
                 this.oauth = new OAuthManager(this.storage, this.network);
                 this.leaderboard = new LeaderboardManager(this.oauth, this.tracker, this.storage);
                 this.cloudSync = new CloudSyncManager(this.storage, this.oauth, this.tracker);
-                this.cloudSync.setHistoryManager(this.historyMgr);  // 设置历史管理器引用
+                this.cloudSync.setHistoryManager(this.historyMgr);
                 this.lbTab = this.storage.getGlobal('leaderboardTab', 'daily');
             }
-
-            // 状态变量
+        }
+        
+        // 初始化状态变量
+        _initState() {
             this.prevReqs = [];
             this.trendTab = this.storage.getGlobal('trendTab', 'today');
-            if (['last', '7d'].includes(this.trendTab)) {
+            // 兼容性：修复旧版本的无效 tab 值
+            if (!['today', 'week', 'month', 'year', 'all'].includes(this.trendTab)) {
                 this.trendTab = 'today';
                 this.storage.setGlobal('trendTab', 'today');
             }
@@ -4090,8 +4433,11 @@
             this.cachedReqs = [];
             this.loading = false;
             this._readingTimer = null;
-
-            // 初始化UI
+            this._destroyed = false;  // 销毁标记
+        }
+        
+        // 初始化 UI
+        _initUI() {
             Styles.inject();
             this._createPanel();
             this.renderer = new Renderer(this);
@@ -4103,71 +4449,89 @@
             // 工单管理器初始化
             if (this.hasLeaderboard && this.oauth) {
                 this.ticketManager = new TicketManager(this.oauth, this.$.panelBody);
-                this.ticketManager.init().catch(e => console.warn('[TicketManager] Init error:', e));
+                this.ticketManager.init().catch(e => Logger.warn('TicketManager init error:', e));
             }
-
+        }
+        
+        // 初始化云服务
+        _initCloudServices() {
             // 检查待处理的 OAuth 登录结果（统一同窗口模式）
-            // 返回 true 表示刚完成登录，已经触发了云同步，不需要再重复
             let justLoggedIn = false;
             if (this.hasLeaderboard && this.oauth) {
                 justLoggedIn = this._checkPendingOAuthLogin();
             }
 
-            // 云同步初始化
-            if (this.hasLeaderboard) {
-                // 注册同步状态回调，更新顶部按钮状态
-                this.cloudSync.setSyncStateCallback(syncing => {
-                    if (this.$.btnCloudSync) {
-                        this.$.btnCloudSync.disabled = syncing;
-                        this.$.btnCloudSync.textContent = syncing ? '⏳' : '☁️';
-                        this.$.btnCloudSync.title = syncing ? '同步中...' : '云同步';
-                    }
-                    // 云同步完成时检查未读工单
-                    if (!syncing) {
-                        this.ticketManager?._checkUnread();
-                    }
-                });
-
-                if (this.oauth.isLoggedIn() && !justLoggedIn) {
-                    // 已登录用户（非刚登录）：进行常规同步
-                    // 确保 storage 使用正确的用户名（从 OAuth 用户信息同步）
-                    const oauthUser = this.oauth.getUserInfo();
-                    if (oauthUser?.username) {
-                        const currentUser = this.storage.getUser();
-                        if (currentUser !== oauthUser.username) {
-                            this.storage.setUser(oauthUser.username);
-                            this.storage.invalidateCache();  // 清除缓存确保使用新 key
-                            this.storage.migrate(oauthUser.username);
-                        }
-                        // 使用 OAuth 用户信息更新界面（即使 connect API 失败也能显示用户信息）
-                        this._updateUserInfoFromOAuth(oauthUser);
-                    }
-                    // 串行化同步请求，避免并发压力
-                    this.cloudSync.onPageLoad().then(() => {
-                        // reading 同步完成后再同步 requirements
-                        return this.cloudSync.syncRequirementsOnLoad();
-                    }).catch(e => console.warn('[CloudSync] Sync error:', e));
-                    this._syncPrefs();
-                    if (this.oauth.isJoined()) this.leaderboard.startSync();
-                    this._updateLoginUI();
-                } else if (justLoggedIn) {
-                    // 刚完成登录：_handlePendingLoginResult 已处理同步和 UI 更新
-                    if (this.oauth.isJoined()) this.leaderboard.startSync();
-                } else {
-                    // 未登录：显示登录提示
-                    this._checkLoginPrompt();
+            if (!this.hasLeaderboard) return;
+            
+            // 注册同步状态回调
+            this.cloudSync.setSyncStateCallback(syncing => {
+                if (this._destroyed) return;
+                if (this.$.btnCloudSync) {
+                    this.$.btnCloudSync.disabled = syncing;
+                    this.$.btnCloudSync.textContent = syncing ? '⏳' : '☁️';
+                    this.$.btnCloudSync.title = syncing ? '同步中...' : '云同步';
                 }
-            }
+                // 云同步完成时检查未读工单
+                if (!syncing) this.ticketManager?._checkUnread();
+            });
 
-            // 事件监听
-            window.addEventListener('resize', Utils.debounce(() => this._onResize(), 250));
-            setInterval(() => this.fetch(), CONFIG.INTERVALS.REFRESH);
+            if (this.oauth.isLoggedIn() && !justLoggedIn) {
+                this._initLoggedInUser();
+            } else if (justLoggedIn) {
+                if (this.oauth.isJoined()) this.leaderboard.startSync();
+            } else {
+                this._checkLoginPrompt();
+            }
+        }
+        
+        // 初始化已登录用户
+        _initLoggedInUser() {
+            const oauthUser = this.oauth.getUserInfo();
+            if (oauthUser?.username) {
+                const currentUser = this.storage.getUser();
+                if (currentUser !== oauthUser.username) {
+                    this.storage.setUser(oauthUser.username);
+                    this.storage.invalidateCache();
+                    this.storage.migrate(oauthUser.username);
+                }
+                this._updateUserInfoFromOAuth(oauthUser);
+            }
+            // 串行化同步请求
+            this.cloudSync.onPageLoad()
+                .then(() => this.cloudSync.syncRequirementsOnLoad())
+                .catch(e => Logger.warn('CloudSync error:', e));
+            this._syncPrefs();
+            if (this.oauth.isJoined()) this.leaderboard.startSync();
+            this._updateLoginUI();
+        }
+        
+        // 初始化事件监听器
+        _initEventListeners() {
+            // 窗口大小变化
+            this._resizeHandler = Utils.debounce(() => this._onResize(), 250);
+            window.addEventListener('resize', this._resizeHandler);
             
-            // 自动检查版本更新（首次进入时显示气泡）
-            setTimeout(() => this._checkUpdate(true), 2000);
+            // 订阅 Token 过期事件
+            EventBus.on('auth:expired', () => {
+                this.renderer?.showToast('⚠️ 登录已过期，请重新登录');
+                this._updateLoginUI();
+            });
+        }
+        
+        // 初始化定时任务
+        _initTimers() {
+            // 定期刷新数据（只有领导者标签页执行）
+            this._refreshTimer = setInterval(() => {
+                if (!this._destroyed && TabLeader.isLeader()) {
+                    this.fetch();
+                }
+            }, CONFIG.INTERVALS.REFRESH);
             
-            // 加载系统公告（延迟加载，不影响主要功能）
-            setTimeout(() => this._loadAnnouncement(), 1500);
+            // 延迟检查版本更新
+            setTimeout(() => !this._destroyed && this._checkUpdate(true), 2000);
+            
+            // 延迟加载系统公告
+            setTimeout(() => !this._destroyed && this._loadAnnouncement(), 1500);
         }
 
         _createPanel() {
@@ -6008,36 +6372,54 @@
         }
 
         destroy() {
-            // 清理阅读追踪器
-            this.tracker.destroy();
-            
-            // 清理排行榜相关
-            if (this.hasLeaderboard) {
-                this.leaderboard.destroy();
-                this.cloudSync.destroy();
-            }
-            
-            // 清理工单管理器
-            if (this.ticketManager) {
-                this.ticketManager.destroy();
-            }
-            
-            // 保存数据
-            this.storage.flush();
+            if (this._destroyed) return;
+            this._destroyed = true;
             
             // 清理定时器
+            if (this._refreshTimer) {
+                clearInterval(this._refreshTimer);
+                this._refreshTimer = null;
+            }
             if (this._readingTimer) {
                 clearInterval(this._readingTimer);
                 this._readingTimer = null;
             }
             
+            // 清理事件监听器
+            if (this._resizeHandler) {
+                window.removeEventListener('resize', this._resizeHandler);
+            }
+            
+            // 清理阅读追踪器
+            this.tracker?.destroy();
+            
+            // 清理排行榜相关
+            if (this.hasLeaderboard) {
+                this.leaderboard?.destroy();
+                this.cloudSync?.destroy();
+            }
+            
+            // 清理工单管理器
+            this.ticketManager?.destroy();
+            
+            // 保存数据
+            this.storage?.flush();
+            
+            // 清理事件总线
+            EventBus.clear();
+            
             // 移除面板
-            this.el.remove();
+            this.el?.remove();
+            
+            Logger.log('Panel destroyed');
         }
     }
 
     // ==================== 启动 ====================
     async function startup() {
+        // 初始化全局领导者管理器（必须在其他组件之前）
+        TabLeader.init();
+        
         // 性能优化：使用 requestIdleCallback 在空闲时加载非关键配置
         requestIdleCallback(() => {
             Network.loadReadingLevels().catch(() => {});
@@ -6047,7 +6429,7 @@
         try {
             new Panel();
         } catch (e) {
-            console.error('[LDStatus Pro] 初始化失败:', e);
+            Logger.error('Panel initialization failed:', e);
         }
     }
 
