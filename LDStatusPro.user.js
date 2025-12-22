@@ -1,7 +1,7 @@
 ﻿    // ==UserScript==
     // @name         LDStatus Pro
     // @namespace    http://tampermonkey.net/
-    // @version      3.5.0.4
+    // @version      3.5.0.6
     // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计、排行榜系统、我的活动查看。两站点均支持排行榜和云同步功能
     // @author       JackLiii
     // @license      MIT
@@ -19,7 +19,7 @@
     // @connect      idcflare.com
     // @connect      github.com
     // @connect      raw.githubusercontent.com
-    // @connect      https://ldstatus-pro-api.jackcai711.workers.dev
+    // @connect      ldstatus-pro-api.jackcai711.workers.dev
     // @connect      *.workers.dev
     // @updateURL    https://raw.githubusercontent.com/caigg188/LDStatusPro/main/LDStatusPro.user.js
     // @downloadURL  https://raw.githubusercontent.com/caigg188/LDStatusPro/main/LDStatusPro.user.js
