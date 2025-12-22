@@ -1,7 +1,7 @@
 ﻿    // ==UserScript==
     // @name         LDStatus Pro
     // @namespace    http://tampermonkey.net/
-    // @version      3.5.0.0
+    // @version      3.5.0.1
     // @description  在 Linux.do 和 IDCFlare 页面显示信任级别进度，支持历史趋势、里程碑通知、阅读时间统计、排行榜系统、我的活动查看。两站点均支持排行榜和云同步功能
     // @author       JackLiii
     // @license      MIT
@@ -393,7 +393,8 @@
                 lastUploadHash: 'last_upload_hash', leaderboardToken: 'leaderboard_token',
                 leaderboardUser: 'leaderboard_user', leaderboardJoined: 'leaderboard_joined',
                 leaderboardTab: 'leaderboard_tab',
-                readingLevels: 'reading_levels', readingLevelsTime: 'reading_levels_time'
+                readingLevels: 'reading_levels', readingLevelsTime: 'reading_levels_time',
+                websiteUrl: 'website_url', websiteUrlDate: 'website_url_date'
             },
             // 用户特定的存储键
             USER_KEYS: new Set(['history', 'milestones', 'lastVisit', 'todayData', 'userAvatar', 'readingTime']),
@@ -2897,6 +2898,48 @@
                 }
             }
 
+            /**
+             * 获取官网URL（公开接口，不需要登录）
+             * 每天最多请求一次，使用本地缓存
+             * @returns {Promise<string>} 官网URL
+             */
+            async getWebsiteUrl() {
+                const DEFAULT_URL = 'https://ldspro.qzz.io/';
+                const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+                
+                try {
+                    // 检查今日是否已请求过
+                    const cachedDate = GM_getValue('ldsp_website_url_date', null);
+                    const cachedUrl = GM_getValue('ldsp_website_url', null);
+                    
+                    if (cachedDate === today && cachedUrl) {
+                        return cachedUrl;
+                    }
+                    
+                    // 今日未请求，发起请求
+                    const response = await fetch(`${CONFIG.LEADERBOARD_API}/api/config/website-url`);
+                    if (!response.ok) {
+                        // 请求失败，返回缓存或默认值
+                        return cachedUrl || DEFAULT_URL;
+                    }
+                    
+                    const result = await response.json();
+                    if (result.success && result.data?.url) {
+                        // 更新缓存
+                        GM_setValue('ldsp_website_url', result.data.url);
+                        GM_setValue('ldsp_website_url_date', today);
+                        return result.data.url;
+                    }
+                    
+                    return cachedUrl || DEFAULT_URL;
+                } catch (e) {
+                    console.error('[CloudSync] Get website URL failed:', e);
+                    // 出错时返回缓存或默认值
+                    const cachedUrl = GM_getValue('ldsp_website_url', null);
+                    return cachedUrl || DEFAULT_URL;
+                }
+            }
+
             destroy() {
                 this._timer && clearInterval(this._timer);
                 this._timer = null;
@@ -3243,14 +3286,14 @@
     .ldsp-modal-btn.danger:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(224,122,141,.4)}
     .ldsp-modal-btn.danger:active{transform:translateY(0)}
     .ldsp-modal-note{margin-top:14px;font-size:11px;color:var(--txt-mut);text-align:center;font-weight:500}
-    .ldsp-confirm-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(18,19,26,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;z-index:20;opacity:0;pointer-events:none;transition:opacity .3s var(--ease);border-radius:inherit}
+    .ldsp-confirm-overlay{position:absolute;top:0;left:0;right:0;bottom:0;width:100%;height:100%;box-sizing:border-box;background:rgba(18,19,26,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;z-index:20;opacity:0;pointer-events:none;transition:opacity .3s var(--ease);border-radius:inherit;margin:0;padding:0 20px}
     .ldsp-confirm-overlay.show{opacity:1;pointer-events:auto}
-    .ldsp-confirm-box{background:linear-gradient(145deg,var(--bg-card),var(--bg));border-radius:var(--r-lg);padding:24px 20px;width:calc(100% - 40px);max-width:260px;box-shadow:var(--shadow-lg),0 0 40px rgba(224,122,141,.1);transform:scale(.92) translateY(20px);transition:transform .35s var(--ease-spring);border:1px solid var(--border2);position:relative;overflow:hidden}
+    .ldsp-confirm-box{background:linear-gradient(145deg,var(--bg-card),var(--bg));border-radius:var(--r-lg);padding:24px 20px;width:100%;max-width:260px;box-shadow:var(--shadow-lg),0 0 40px rgba(224,122,141,.1);transform:scale(.92) translateY(20px);transition:transform .35s var(--ease-spring);border:1px solid var(--border2);position:relative;overflow:hidden;margin:0 auto}
     .ldsp-confirm-box::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--grad-warm);opacity:.8}
     .ldsp-confirm-overlay.show .ldsp-confirm-box{transform:scale(1) translateY(0)}
     .ldsp-confirm-icon{text-align:center;font-size:40px;margin-bottom:14px;filter:drop-shadow(0 4px 8px rgba(224,122,141,.3));animation:confirm-icon-bounce .5s var(--ease-spring) .1s both}
     @keyframes confirm-icon-bounce{0%{transform:scale(0) rotate(-20deg);opacity:0}60%{transform:scale(1.15) rotate(5deg)}100%{transform:scale(1) rotate(0);opacity:1}}
-    .ldsp-confirm-title{text-align:center;font-size:16px;font-weight:700;margin-bottom:10px;color:var(--txt);letter-spacing:-.02em}
+    .ldsp-confirm-title{text-align:center;font-size:16px;font-weight:700;margin-bottom:10px;color:#ef4444;letter-spacing:-.02em}
     .ldsp-confirm-msg{text-align:center;font-size:12px;color:var(--txt-sec);line-height:1.7;margin-bottom:20px;padding:0 4px}
     .ldsp-confirm-btns{display:flex;gap:10px}
     .ldsp-confirm-btn{flex:1;padding:11px 14px;border:none;border-radius:var(--r-sm);font-size:12px;font-weight:600;transition:background .15s,transform .15s,box-shadow .15s,border-color .15s;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
@@ -3260,7 +3303,7 @@
     @media (hover:hover){.ldsp-confirm-btn.confirm:hover{transform:translateY(-2px);box-shadow:0 8px 22px rgba(224,122,141,.4)}}
     .ldsp-confirm-btn:active{transform:scale(.96)}
     @media (max-width:480px){.ldsp-confirm-box{padding:20px 16px;max-width:240px}.ldsp-confirm-icon{font-size:36px;margin-bottom:12px}.ldsp-confirm-title{font-size:14px}.ldsp-confirm-msg{font-size:11px;margin-bottom:16px}.ldsp-confirm-btn{padding:10px 12px;font-size:11px}}
-    @media (max-width:320px){.ldsp-confirm-box{padding:16px 12px;max-width:220px;width:calc(100% - 24px)}.ldsp-confirm-icon{font-size:32px;margin-bottom:10px}.ldsp-confirm-title{font-size:13px}.ldsp-confirm-msg{font-size:10px;margin-bottom:14px;line-height:1.6}.ldsp-confirm-btns{gap:8px}.ldsp-confirm-btn{padding:9px 10px;font-size:10px}}
+    @media (max-width:320px){.ldsp-confirm-overlay{padding:0 12px}.ldsp-confirm-box{padding:16px 12px;max-width:220px}.ldsp-confirm-icon{font-size:32px;margin-bottom:10px}.ldsp-confirm-title{font-size:13px}.ldsp-confirm-msg{font-size:10px;margin-bottom:14px;line-height:1.6}.ldsp-confirm-btns{gap:8px}.ldsp-confirm-btn{padding:9px 10px;font-size:10px}}
     .ldsp-no-chg{text-align:center;padding:18px;color:var(--txt-mut);font-size:11px;font-weight:500}
     .ldsp-lb-hdr{display:flex;align-items:center;justify-content:space-between;padding:12px;background:var(--bg-card);border-radius:var(--r-md);margin-bottom:10px;border:1px solid var(--border)}
     .ldsp-lb-status{display:flex;align-items:center;gap:10px}
@@ -3345,6 +3388,8 @@
     .ldsp-action-btn .ldsp-action-text{overflow:hidden;text-overflow:ellipsis}
     @media (max-width:320px){#ldsp-panel{--w:240px}#ldsp-panel.collapsed{width:34px!important;height:34px!important;border-radius:8px}#ldsp-panel.collapsed .ldsp-toggle-logo{width:18px;height:18px}.ldsp-hdr{padding:5px 6px;gap:3px;min-height:36px}.ldsp-hdr-info{gap:3px}.ldsp-site-icon{width:16px;height:16px;border-radius:4px;border-width:1px}.ldsp-site-ver{display:none}.ldsp-title{font-size:9px}.ldsp-app-name{display:none}.ldsp-hdr-btns{gap:2px}.ldsp-hdr-btns button{width:20px;height:20px;font-size:9px;border-radius:4px}.ldsp-user-actions{flex-direction:column}.ldsp-action-btn{flex:1 1 100%;min-width:0}}
     .ldsp-logout-btn,.ldsp-ticket-btn{flex:0 0 auto;min-width:auto;padding:5px 8px}
+    .ldsp-logout-btn{background:linear-gradient(135deg,rgba(239,68,68,.06),rgba(220,38,38,.08));border-color:rgba(239,68,68,.15);color:rgba(239,68,68,.7)}
+    .ldsp-logout-btn:hover{background:linear-gradient(135deg,rgba(239,68,68,.12),rgba(220,38,38,.16));border-color:rgba(239,68,68,.3);color:#ef4444}
     .ldsp-login-btn{flex:1 1 100%;background:linear-gradient(135deg,rgba(212,168,83,.15),rgba(196,147,57,.2));border-color:rgba(212,168,83,.3);color:var(--warn);animation:login-pulse 2.5s ease-in-out infinite}
     .ldsp-login-btn:hover{background:linear-gradient(135deg,rgba(212,168,83,.25),rgba(196,147,57,.3));border-color:var(--warn)}
     @keyframes login-pulse{0%,100%{box-shadow:0 0 0 0 rgba(212,168,83,.3)}50%{box-shadow:0 0 12px 2px rgba(212,168,83,.2)}}
@@ -3414,7 +3459,18 @@
     .ldsp-ticket-reply-btn:hover{box-shadow:0 4px 12px rgba(107,140,239,.3)}
     .ldsp-ticket-reply-btn:disabled{opacity:.5;cursor:not-allowed}
     .ldsp-ticket-closed-hint{text-align:center;color:var(--txt-mut);font-size:10px;padding:10px}
+    .ldsp-user-meta{display:flex;align-items:center;flex-wrap:wrap;margin-top:2px}
     .ldsp-follow-stats{display:flex;gap:6px;padding:2px 0}
+    .ldsp-follow-combined{display:inline-flex;align-items:center;gap:3px;padding:2px 0;font-size:10px;color:var(--txt-mut)}
+    .ldsp-follow-part{cursor:pointer;transition:color .15s;font-weight:500}
+    .ldsp-follow-part:hover{color:var(--accent)}
+    .ldsp-follow-sep{color:var(--txt-mut);margin:0 1px}
+    .ldsp-follow-num-following,.ldsp-follow-num-followers{font-weight:600;color:var(--txt-sec);transition:color .15s}
+    .ldsp-follow-part:hover .ldsp-follow-num-following,.ldsp-follow-part:hover .ldsp-follow-num-followers{color:var(--accent)}
+    .ldsp-join-days{display:inline-flex;align-items:center;font-size:10px;color:var(--txt-mut);margin-left:6px;cursor:pointer;transition:color .15s}
+    .ldsp-join-days:hover{color:var(--accent)}
+    .ldsp-join-days-num{font-weight:600;color:var(--txt-sec);margin:0 2px;transition:color .15s}
+    .ldsp-join-days:hover .ldsp-join-days-num{color:var(--accent)}
     .ldsp-follow-stat{display:flex;align-items:center;gap:3px;padding:2px 6px;background:var(--bg-el);border:1px solid var(--border);border-radius:12px;font-size:9px;color:var(--txt-sec);cursor:pointer;transition:all .15s}
     .ldsp-follow-stat:hover{background:var(--bg-hover);border-color:var(--accent);color:var(--accent)}
     .ldsp-follow-stat:active{transform:scale(.98)}
@@ -3462,10 +3518,8 @@
     .ldsp-follow-item:hover .ldsp-follow-arrow{opacity:1;transform:translateX(2px);color:var(--accent)}
     .ldsp-activity-content{flex:1;overflow-y:auto;padding:8px}
     .ldsp-topic-list{display:flex;flex-direction:column;gap:6px}
-    .ldsp-topic-list-enhanced .ldsp-topic-item{display:flex;flex-direction:row;align-items:center;gap:8px;padding:10px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r-md);cursor:pointer;transition:all .15s ease;text-decoration:none;position:relative}
-    .ldsp-topic-item::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent);opacity:0;transition:opacity .15s;border-radius:2px 0 0 2px}
-    .ldsp-topic-item:hover{background:var(--bg-hover);border-color:rgba(107,140,239,.4);box-shadow:0 2px 8px rgba(0,0,0,.06)}
-    .ldsp-topic-item:hover::before{opacity:1}
+    .ldsp-topic-list-enhanced .ldsp-topic-item{display:flex;flex-direction:row;align-items:center;gap:8px;padding:10px;background:var(--bg-card);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--r-md);cursor:pointer;transition:all .15s ease;text-decoration:none}
+    .ldsp-topic-item:hover{background:var(--bg-hover);border-color:rgba(107,140,239,.5);border-left-color:#5a7de0;transform:translateX(2px);box-shadow:0 2px 8px rgba(107,140,239,.1)}
     .ldsp-topic-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}
     .ldsp-topic-header{display:flex;flex-direction:column;gap:4px}
     .ldsp-topic-title-row{display:flex;align-items:center;gap:5px;min-width:0}
@@ -3477,8 +3531,8 @@
     .ldsp-topic-item:hover .ldsp-topic-title{color:var(--accent)}
     .ldsp-topic-info{display:flex;align-items:center;gap:4px;flex-wrap:wrap;min-height:16px}
     .ldsp-topic-tags{display:flex;gap:3px;flex-wrap:wrap}
-    .ldsp-topic-tag{padding:1px 5px;background:var(--bg-el);border-radius:6px;font-size:8px;color:var(--txt-sec);max-width:55px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .ldsp-topic-tag-more{padding:1px 4px;background:rgba(107,140,239,.1);border-radius:6px;font-size:8px;color:var(--accent);font-weight:500}
+    .ldsp-topic-tag{padding:1px 6px;background:rgba(107,140,239,.08);border:1px solid rgba(107,140,239,.2);border-radius:8px;font-size:8px;color:#5a7de0;max-width:55px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ldsp-topic-tag-more{padding:1px 5px;background:rgba(107,140,239,.15);border:1px solid rgba(107,140,239,.3);border-radius:8px;font-size:8px;color:#4a6bc9;font-weight:600}
     .ldsp-topic-footer{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
     .ldsp-topic-posters{display:flex;align-items:center;flex-shrink:0}
     .ldsp-topic-avatar{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--bg-card);margin-left:-5px;object-fit:cover;background:var(--bg-el)}
@@ -3551,10 +3605,8 @@
     .ldsp-like-excerpt .lightbox,.ldsp-like-excerpt .lightbox img{display:inline!important;max-width:16px!important;max-height:16px!important}
     .ldsp-like-excerpt .anchor{display:none!important}
     .ldsp-mytopic-list{display:flex;flex-direction:column;gap:8px}
-    .ldsp-mytopic-item{display:flex;flex-direction:column;gap:5px;padding:10px;background:var(--bg-card);border:1px solid var(--border);border-left:3px solid #8b5cf6;border-radius:var(--r-md);cursor:pointer;transition:all .15s ease;text-decoration:none;position:relative;overflow:hidden}
-    .ldsp-mytopic-item::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,#8b5cf6,#a78bfa);opacity:0;transition:opacity .15s}
-    .ldsp-mytopic-item:hover{background:var(--bg-hover);border-color:rgba(139,92,246,.5);transform:translateX(2px);box-shadow:0 2px 8px rgba(139,92,246,.1)}
-    .ldsp-mytopic-item:hover::before{opacity:1}
+    .ldsp-mytopic-item{display:flex;flex-direction:column;gap:5px;padding:10px;background:var(--bg-card);border:1px solid var(--border);border-left:3px solid #8b5cf6;border-radius:var(--r-md);cursor:pointer;transition:all .15s ease;text-decoration:none}
+    .ldsp-mytopic-item:hover{background:var(--bg-hover);border-color:rgba(139,92,246,.5);border-left-color:#7c3aed;transform:translateX(2px);box-shadow:0 2px 8px rgba(139,92,246,.1)}
     .ldsp-mytopic-item.closed{opacity:.7}
     .ldsp-mytopic-item.closed .ldsp-mytopic-title{text-decoration:line-through;color:var(--txt-mut)}
     .ldsp-mytopic-header{display:flex;align-items:flex-start;gap:6px}
@@ -3582,7 +3634,129 @@
     .ldsp-load-more.loading::after{content:'';width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:ldsp-spin .8s linear infinite;margin-left:6px}
     .ldsp-activity-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px;text-align:center;color:var(--txt-mut)}
     .ldsp-activity-placeholder-icon{font-size:32px;margin-bottom:10px;opacity:.5}
-    .ldsp-activity-placeholder-text{font-size:11px}`;
+    .ldsp-activity-placeholder-text{font-size:11px}
+    .ldsp-tooltip{position:fixed;z-index:2147483647;max-width:220px;padding:6px 10px;background:linear-gradient(135deg,rgba(30,32,48,.96),rgba(24,26,38,.98));color:#e8eaf0;font-size:11px;font-weight:500;line-height:1.4;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.3),0 0 0 1px rgba(255,255,255,.06);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);pointer-events:none;opacity:0;transform:translateY(4px);transition:opacity .15s ease,transform .15s ease;white-space:pre-line;word-break:break-word}
+    .ldsp-tooltip.show{opacity:1;transform:translateY(0)}
+    .ldsp-tooltip::before{content:'';position:absolute;width:8px;height:8px;background:inherit;transform:rotate(45deg);box-shadow:-1px -1px 0 rgba(255,255,255,.06)}
+    .ldsp-tooltip.top::before{bottom:-4px;left:50%;margin-left:-4px}
+    .ldsp-tooltip.bottom::before{top:-4px;left:50%;margin-left:-4px}
+    .ldsp-tooltip.left::before{bottom:-4px;right:12px}
+    .ldsp-tooltip.right::before{bottom:-4px;left:12px}
+    #ldsp-panel.light .ldsp-tooltip{background:linear-gradient(135deg,rgba(255,255,255,.98),rgba(248,250,254,.98));color:#2d3148;box-shadow:0 4px 16px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.06)}
+    #ldsp-panel.light .ldsp-tooltip::before{box-shadow:-1px -1px 0 rgba(0,0,0,.04)}`;
+            }
+        };
+        
+        // ==================== Tooltip 管理器 ====================
+        const Tooltip = {
+            el: null,
+            timer: null,
+            currentTarget: null,
+            
+            init() {
+                if (this.el) return;
+                this.el = document.createElement('div');
+                this.el.className = 'ldsp-tooltip';
+                document.body.appendChild(this.el);
+            },
+            
+            show(target, text, delay = 400) {
+                if (!text || !target) return;
+                this.hide();
+                this.currentTarget = target;
+                this.timer = setTimeout(() => {
+                    if (this.currentTarget !== target) return;
+                    this.el.textContent = text;
+                    this.el.classList.remove('show', 'top', 'bottom', 'left', 'right');
+                    
+                    // 先显示以获取尺寸
+                    this.el.style.visibility = 'hidden';
+                    this.el.style.display = 'block';
+                    
+                    const rect = target.getBoundingClientRect();
+                    const tipRect = this.el.getBoundingClientRect();
+                    const padding = 8;
+                    
+                    // 计算位置（优先显示在上方）
+                    let top, left;
+                    const spaceAbove = rect.top;
+                    const spaceBelow = window.innerHeight - rect.bottom;
+                    
+                    if (spaceAbove >= tipRect.height + padding || spaceAbove > spaceBelow) {
+                        // 显示在上方
+                        top = rect.top - tipRect.height - padding;
+                        this.el.classList.add('top');
+                    } else {
+                        // 显示在下方
+                        top = rect.bottom + padding;
+                        this.el.classList.add('bottom');
+                    }
+                    
+                    // 水平居中，但不超出屏幕
+                    left = rect.left + (rect.width - tipRect.width) / 2;
+                    if (left < padding) {
+                        left = padding;
+                        this.el.classList.add('right');
+                    } else if (left + tipRect.width > window.innerWidth - padding) {
+                        left = window.innerWidth - tipRect.width - padding;
+                        this.el.classList.add('left');
+                    }
+                    
+                    // 确保不超出顶部
+                    if (top < padding) top = padding;
+                    
+                    this.el.style.top = `${top}px`;
+                    this.el.style.left = `${left}px`;
+                    this.el.style.visibility = '';
+                    
+                    // 添加面板主题类
+                    const panel = document.getElementById('ldsp-panel');
+                    if (panel?.classList.contains('light')) {
+                        this.el.closest('body').querySelector('.ldsp-tooltip')?.classList.add('light-theme');
+                    }
+                    
+                    requestAnimationFrame(() => this.el.classList.add('show'));
+                }, delay);
+            },
+            
+            hide() {
+                if (this.timer) {
+                    clearTimeout(this.timer);
+                    this.timer = null;
+                }
+                this.currentTarget = null;
+                if (this.el) {
+                    this.el.classList.remove('show');
+                }
+            },
+            
+            // 绑定到面板
+            bindToPanel(panel) {
+                this.init();
+                
+                // 使用事件委托
+                panel.addEventListener('mouseenter', (e) => {
+                    const target = e.target.closest('[title], [data-tip]');
+                    if (!target) return;
+                    const text = target.dataset.tip || target.getAttribute('title');
+                    if (text) {
+                        // 临时移除 title 防止浏览器默认提示
+                        if (target.hasAttribute('title')) {
+                            target.dataset.tip = text;
+                            target.removeAttribute('title');
+                        }
+                        this.show(target, text);
+                    }
+                }, true);
+                
+                panel.addEventListener('mouseleave', (e) => {
+                    const target = e.target.closest('[data-tip]');
+                    if (target) this.hide();
+                }, true);
+                
+                // 滚动和点击时隐藏
+                panel.addEventListener('scroll', () => this.hide(), true);
+                panel.addEventListener('click', () => this.hide(), true);
             }
         };
 
@@ -3601,8 +3775,8 @@
                 this.currentTicket = null;
                 this.currentView = 'list';
                 this.unreadCount = 0;
-                this._pollTimer = null;
                 this._isOverlayOpen = false;  // 工单面板是否打开
+                this._lastHiddenTime = null;  // 页面隐藏时间，用于触发式检测
             }
 
             async init() {
@@ -3614,15 +3788,20 @@
             }
             
             _bindVisibilityHandler() {
-                // 页面可见性变化时控制轮询（切换标签页、最小化窗口等）
+                // 页面可见性变化时触发式检测（切换标签页、最小化窗口等）
                 this._visibilityHandler = () => {
                     if (document.hidden) {
-                        // 页面隐藏时，停止轮询
-                        this._stopUnreadPoll();
-                    } else if (this._isOverlayOpen) {
-                        // 页面恢复可见且工单面板打开时，立即检查并恢复轮询
-                        this._checkUnread();
-                        this._startUnreadPoll();
+                        // 页面隐藏时，记录时间
+                        this._lastHiddenTime = Date.now();
+                    } else {
+                        // 页面恢复可见时，检查是否超过10分钟阈值
+                        const hiddenDuration = this._lastHiddenTime ? Date.now() - this._lastHiddenTime : 0;
+                        const TEN_MINUTES = 10 * 60 * 1000;  // 10分钟
+                        if (hiddenDuration >= TEN_MINUTES) {
+                            // 超过10分钟，触发检测
+                            this._checkUnread();
+                        }
+                        this._lastHiddenTime = null;
                     }
                 };
                 document.addEventListener('visibilitychange', this._visibilityHandler);
@@ -3682,22 +3861,8 @@
                 }
             }
 
-            // 启动轮询（仅在工单面板打开时调用）
-            _startUnreadPoll() {
-                if (this._pollTimer) return;  // 避免重复启动
-                // 工单面板打开时，每 60 秒检查一次
-                this._pollTimer = setInterval(() => this._checkUnread(), 60000);
-            }
-            
-            // 停止轮询
-            _stopUnreadPoll() {
-                if (this._pollTimer) {
-                    clearInterval(this._pollTimer);
-                    this._pollTimer = null;
-                }
-            }
-
             // 检查未读工单数（触发式调用，支持跨标签页缓存）
+            // 触发时机：1. 面板打开 2. 页面可见性恢复(>10分钟) 3. 数据同步完成
             async _checkUnread(forceRefresh = false) {
                 // 1. 检查登录状态
                 if (!this.oauth?.isLoggedIn()) return;
@@ -3767,10 +3932,9 @@
                 if (activeTab?.dataset.tab !== 'create') {
                     this._renderList();
                 }
-                // 工单面板打开时立即检查一次并启动轮询（仅在页面可见时）
+                // 工单面板打开时立即检查一次（触发式检测）
                 if (!document.hidden) {
                     this._checkUnread(true);  // 强制刷新，忽略缓存
-                    this._startUnreadPoll();
                 }
             }
 
@@ -3789,10 +3953,7 @@
             }
 
             hide() {
-                // 先停止轮询，确保不会有遗留的定时器
-                this._stopUnreadPoll();
                 this._isOverlayOpen = false;
-                
                 this.overlay.classList.remove('show');
                 this.currentView = 'list';
                 this.currentTicket = null;
@@ -4120,17 +4281,21 @@
                 user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v2"/></svg>'
             };
             
-            constructor(network, storage, panelBody) {
+            constructor(network, storage, panelBody, renderer) {
                 this.network = network;
                 this.storage = storage;
                 this.panelBody = panelBody;
+                this.renderer = renderer;
                 this.overlay = null;
                 this.following = [];
                 this.followers = [];
                 this.followingCount = 0;
                 this.followersCount = 0;
+                this.cakedate = null;
+                this.animatedAvatar = null;
                 this._loaded = false;
                 this._loading = false;
+                this._profileLoaded = false;
             }
 
             async init() {
@@ -4150,8 +4315,11 @@
                     if (cached && typeof cached === 'object') {
                         this.followingCount = cached.followingCount || 0;
                         this.followersCount = cached.followersCount || 0;
+                        this.cakedate = cached.cakedate || null;
+                        this.animatedAvatar = cached.animatedAvatar || null;
                         // 立即更新显示
                         this._updateStats();
+                        this._updateDays();
                     }
                 } catch (e) {
                     // 缓存读取失败，忽略
@@ -4168,6 +4336,8 @@
                     GM_setValue(cacheKey, {
                         followingCount: this.followingCount,
                         followersCount: this.followersCount,
+                        cakedate: this.cakedate,
+                        animatedAvatar: this.animatedAvatar,
                         time: Date.now()
                     });
                 } catch (e) {
@@ -4261,12 +4431,104 @@
                     this._loading = false;
                 }
             }
+            
+            // 加载用户 profile 数据（cakedate, animated_avatar）
+            async loadProfile() {
+                if (this._profileLoaded) return;
+                
+                const username = this.storage.getUser();
+                if (!username) return;
+                
+                const baseUrl = `https://${CURRENT_SITE.domain}`;
+                
+                try {
+                    const profileRes = await this.network.fetchJson(`${baseUrl}/u/${encodeURIComponent(username)}.json`);
+                    if (profileRes && profileRes.user) {
+                        const user = profileRes.user;
+                        let hasChanges = false;
+                        
+                        // 获取 cakedate
+                        if (user.cakedate && user.cakedate !== this.cakedate) {
+                            this.cakedate = user.cakedate;
+                            this._updateDays();
+                            hasChanges = true;
+                        }
+                        
+                        // 获取 animated_avatar
+                        if (user.animated_avatar) {
+                            const animatedUrl = user.animated_avatar.startsWith('http') 
+                                ? user.animated_avatar 
+                                : `${baseUrl}${user.animated_avatar}`;
+                            // 只有动态头像变化时才更新
+                            if (animatedUrl !== this.animatedAvatar) {
+                                this.animatedAvatar = animatedUrl;
+                                // 通过 renderer 渲染头像
+                                if (this.renderer) {
+                                    this.renderer.renderAvatar(animatedUrl);
+                                }
+                                hasChanges = true;
+                            }
+                        }
+                        
+                        this._profileLoaded = true;
+                        if (hasChanges) {
+                            this._saveToCache();
+                        }
+                    }
+                } catch (e) {
+                    Logger.warn('Failed to load user profile:', e.message);
+                }
+            }
+            
+            // 更新注册天数显示
+            _updateDays() {
+                const daysNumEl = document.querySelector('.ldsp-join-days-num');
+                const siteEl = document.querySelector('.ldsp-join-days-site');
+                const joinDaysEl = document.querySelector('.ldsp-join-days');
+                
+                if (!this.cakedate) {
+                    if (joinDaysEl) joinDaysEl.style.display = 'none';
+                    return;
+                }
+                
+                try {
+                    const joinDate = new Date(this.cakedate);
+                    const now = new Date();
+                    const diffTime = Math.abs(now - joinDate);
+                    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                    const siteShort = CURRENT_SITE.domain === 'linux.do' ? 'L站' : 'IF站';
+                    const siteFull = CURRENT_SITE.domain === 'linux.do' ? 'Linux.do' : 'IDCFlare';
+                    if (siteEl) siteEl.textContent = siteShort;
+                    if (daysNumEl) daysNumEl.textContent = diffDays;
+                    if (joinDaysEl) {
+                        joinDaysEl.style.display = '';
+                        // 设置悬浮提示：于xxxx年xx月xx日加入xx站
+                        const year = joinDate.getFullYear();
+                        const month = joinDate.getMonth() + 1;
+                        const day = joinDate.getDate();
+                        joinDaysEl.title = `于${year}年${month}月${day}日加入${siteFull}`;
+                    }
+                } catch (e) {
+                    if (joinDaysEl) joinDaysEl.style.display = 'none';
+                }
+            }
 
             _updateStats() {
+                // 支持新的合并按钮样式
+                const combinedEl = document.querySelector('.ldsp-follow-combined');
+                if (combinedEl) {
+                    const followingNum = combinedEl.querySelector('.ldsp-follow-num-following');
+                    const followersNum = combinedEl.querySelector('.ldsp-follow-num-followers');
+                    if (followingNum) followingNum.textContent = this.followingCount;
+                    if (followersNum) followersNum.textContent = this.followersCount;
+                }
+                // 兼容旧样式
                 const statsEl = document.querySelector('.ldsp-follow-stats');
                 if (statsEl) {
-                    statsEl.querySelector('.ldsp-follow-stat-following .ldsp-follow-stat-num').textContent = this.followingCount;
-                    statsEl.querySelector('.ldsp-follow-stat-followers .ldsp-follow-stat-num').textContent = this.followersCount;
+                    const following = statsEl.querySelector('.ldsp-follow-stat-following .ldsp-follow-stat-num');
+                    const followers = statsEl.querySelector('.ldsp-follow-stat-followers .ldsp-follow-stat-num');
+                    if (following) following.textContent = this.followingCount;
+                    if (followers) followers.textContent = this.followersCount;
                 }
             }
 
@@ -5880,7 +6142,6 @@
                 this.renderer = new Renderer(this);
                 this._bindEvents();
                 this._restore();
-                this._fetchAvatar();
                 this.fetch();
 
                 // 工单管理器初始化
@@ -5889,11 +6150,16 @@
                     this.ticketManager.init().catch(e => Logger.warn('TicketManager init error:', e));
                 }
                 
-                // 关注/粉丝管理器初始化
-                this.followManager = new FollowManager(this.network, this.storage, this.$.panelBody);
+                // 关注/粉丝管理器初始化（包含头像缓存）
+                this.followManager = new FollowManager(this.network, this.storage, this.$.panelBody, this.renderer);
                 this.followManager.init();
-                // 延迟加载关注/粉丝数据（避免阻塞面板渲染）
-                setTimeout(() => this.followManager.loadData().catch(e => Logger.warn('FollowManager load error:', e)), 2000);
+                // 从缓存加载头像（优先动态头像）
+                this._loadAvatarFromCache();
+                // 延迟懒加载关注/粉丝数据和用户profile
+                setTimeout(() => {
+                    this.followManager.loadData().catch(e => Logger.warn('FollowManager load error:', e));
+                    this.followManager.loadProfile().catch(e => Logger.warn('FollowManager profile error:', e));
+                }, 2000);
             }
             
             // 初始化云服务
@@ -5975,6 +6241,8 @@
                     }
                     // 更新顶部阅读时间显示
                     this.renderer.renderReading(this.readingTime, this.tracker.isActive);
+                    // 数据同步完成后触发工单未读检测
+                    this.ticketManager?._checkUnread();
                 });
             }
             
@@ -6042,21 +6310,17 @@
                                         <div class="ldsp-user-handle"></div>
                                     </div>
                                 </div>
-                                <div class="ldsp-follow-stats">
-                                    <div class="ldsp-follow-stat ldsp-follow-stat-following" data-clickable title="查看关注列表">
-                                        <span class="ldsp-follow-stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="10" cy="8" r="4"/><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M19 8h4m-2-2v4"/></svg></span>
-                                        <span class="ldsp-follow-stat-num">-</span>
-                                        <span class="ldsp-follow-stat-label">关注</span>
+                                <div class="ldsp-user-meta">
+                                    <div class="ldsp-follow-combined">
+                                        <span class="ldsp-follow-part ldsp-follow-following" data-clickable data-tab="following" title="查看关注列表">关注 <span class="ldsp-follow-num-following">-</span></span>
+                                        <span class="ldsp-follow-sep">·</span>
+                                        <span class="ldsp-follow-part ldsp-follow-followers" data-clickable data-tab="followers" title="查看粉丝列表"><span class="ldsp-follow-num-followers">-</span> 粉丝</span>
                                     </div>
-                                    <div class="ldsp-follow-stat ldsp-follow-stat-followers" data-clickable title="查看粉丝列表">
-                                        <span class="ldsp-follow-stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="10" cy="8" r="4"/><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M19.5 10.5c-.6-.6-1.5-.6-2.1 0l-.4.4-.4-.4c-.6-.6-1.5-.6-2.1 0-.6.6-.6 1.5 0 2.1l2.5 2.4 2.5-2.4c.6-.6.6-1.5 0-2.1z"/></svg></span>
-                                        <span class="ldsp-follow-stat-num">-</span>
-                                        <span class="ldsp-follow-stat-label">粉丝</span>
-                                    </div>
+                                    <span class="ldsp-join-days">来<span class="ldsp-join-days-site"></span><span class="ldsp-join-days-num">-</span>天</span>
                                 </div>
                                 <div class="ldsp-user-actions">
                                     <div class="ldsp-action-btn ldsp-login-btn" data-clickable title="点击登录"><span class="ldsp-action-icon">🔑</span><span class="ldsp-action-text">点击登录</span></div>
-                                    <div class="ldsp-action-btn ldsp-logout-btn" data-clickable title="注销登录"><span class="ldsp-action-icon">🚪</span><span class="ldsp-action-text">注销</span></div>
+                                    <div class="ldsp-action-btn ldsp-logout-btn" data-clickable title="注销登录"><span class="ldsp-action-icon">⏻</span><span class="ldsp-action-text">注销</span></div>
                                     <div class="ldsp-action-btn ldsp-ticket-btn" data-clickable title="工单系统"><span class="ldsp-action-icon">📪</span><span class="ldsp-action-text">工单</span></div>
                                 </div>
                             </div>
@@ -6081,9 +6345,9 @@
                         </div>
                         <div class="ldsp-confirm-overlay">
                             <div class="ldsp-confirm-box">
-                                <div class="ldsp-confirm-icon">🚪</div>
-                                <div class="ldsp-confirm-title">确认注销登录</div>
-                                <div class="ldsp-confirm-msg">退出后排行榜和云同步功能将不可用，确定要注销吗？</div>
+                                <div class="ldsp-confirm-icon">⏻</div>
+                                <div class="ldsp-confirm-title">确认注销登录吗？</div>
+                                <div class="ldsp-confirm-msg">退出后排行榜和云同步功能将不可用</div>
                                 <div class="ldsp-confirm-btns">
                                     <button class="ldsp-confirm-btn cancel">取消</button>
                                     <button class="ldsp-confirm-btn confirm">确认注销</button>
@@ -6093,6 +6357,9 @@
                     </div>`;
 
                 document.body.appendChild(this.el);
+                
+                // 绑定自定义 Tooltip
+                Tooltip.bindToPanel(this.el);
 
                 this.$ = {
                     header: this.el.querySelector('.ldsp-hdr'),
@@ -6289,7 +6556,28 @@
                     }
                 });
                 
-                // 关注/粉丝统计点击
+                // 关注/粉丝分别点击
+                this.el.querySelectorAll('.ldsp-follow-part').forEach(part => {
+                    part.addEventListener('click', e => {
+                        e.stopPropagation();
+                        const username = this.storage.getUser();
+                        if (!username) {
+                            this.renderer.showToast('⚠️ 请先登录论坛');
+                            return;
+                        }
+                        if (this.followManager) {
+                            // 根据点击的区域打开对应列表
+                            const tabName = part.dataset.tab || 'following';
+                            const tabs = this.followManager.overlay.querySelectorAll('.ldsp-follow-tab');
+                            tabs.forEach(t => t.classList.remove('active'));
+                            const targetTab = this.followManager.overlay.querySelector(`.ldsp-follow-tab[data-tab="${tabName}"]`);
+                            targetTab?.classList.add('active');
+                            this.followManager.show();
+                        }
+                    });
+                });
+                
+                // 兼容旧样式的关注/粉丝统计点击
                 this.el.querySelectorAll('.ldsp-follow-stat').forEach(stat => {
                     stat.addEventListener('click', e => {
                         e.stopPropagation();
@@ -6310,10 +6598,11 @@
                     });
                 });
                 
-                // 阅读卡片点击彩蛋 - 跳转到官网
-                this.$.reading?.addEventListener('click', e => {
+                // 阅读卡片点击彩蛋 - 跳转到官网（动态URL）
+                this.$.reading?.addEventListener('click', async e => {
                     e.stopPropagation();
-                    window.open('https://ldspro.de5.net', '_blank');
+                    const url = await this.cloudSync?.getWebsiteUrl() || 'https://ldspro.qzz.io/';
+                    window.open(url, '_blank');
                 });
 
                 // 标签页切换
@@ -6492,19 +6781,38 @@
                 this.storage.setGlobalNow('theme', light ? 'light' : 'dark');
             }
 
-            _fetchAvatar() {
+            // 从缓存加载头像（优先动态头像）
+            _loadAvatarFromCache() {
+                // 1. 优先使用缓存的动态头像
+                if (this.followManager?.animatedAvatar) {
+                    this.renderer.renderAvatar(this.followManager.animatedAvatar);
+                    return;
+                }
+                // 2. 其次使用缓存的普通头像
+                if (this.avatar) {
+                    this.renderer.renderAvatar(this.avatar);
+                    return;
+                }
+                // 3. 都没有则尝试从页面获取
                 const el = document.querySelector('.current-user img.avatar');
-                if (el) { this._updateAvatar(el.src); return; }
-                this.avatar && this.renderer.renderAvatar(this.avatar);
+                if (el) {
+                    this._updateAvatar(el.src);
+                }
             }
 
+            // 更新普通头像（从页面获取时调用）
             _updateAvatar(url) {
                 if (!url) return;
                 if (url.startsWith('/')) url = `https://${CURRENT_SITE.domain}${url}`;
                 url = url.replace(PATTERNS.AVATAR_SIZE, '/128/');
+                // 只有头像变化时才更新
+                if (this.avatar === url) return;
                 this.avatar = url;
                 this.storage.set('userAvatar', url);
-                this.renderer.renderAvatar(url);
+                // 只有在没有动态头像时才渲染普通头像
+                if (!this.followManager?.animatedAvatar) {
+                    this.renderer.renderAvatar(url);
+                }
             }
 
             _startReadingUpdate() {
@@ -7576,6 +7884,7 @@
                     return;
                 }
                 const logged = this.oauth.isLoggedIn();
+                const forumLogged = !!this.storage.getUser();  // 论坛登录状态
                 this.$.user.classList.toggle('not-logged', !logged);
 
                 // 显示/隐藏云同步按钮
@@ -7593,6 +7902,12 @@
                 // 显示/隐藏登录按钮（已登录时隐藏）
                 if (this.$.loginBtn) {
                     this.$.loginBtn.style.display = logged ? 'none' : '';
+                }
+                
+                // 显示/隐藏关注粉丝和天数（论坛未登录时隐藏整个容器）
+                const userMeta = this.el.querySelector('.ldsp-user-meta');
+                if (userMeta) {
+                    userMeta.style.display = forumLogged ? '' : 'none';
                 }
 
                 if (!logged) {
@@ -7787,6 +8102,18 @@
 
             async _renderActivity() {
                 if (!this.$.activity) return;
+
+                // 检查论坛登录状态：未登录时显示登录提示
+                const username = this.storage.getUser();
+                if (!username) {
+                    this.$.activity.innerHTML = `
+                        <div class="ldsp-lb-login">
+                            <div class="ldsp-lb-login-icon">🔐</div>
+                            <div class="ldsp-lb-login-title">需要登录</div>
+                            <div class="ldsp-lb-login-desc">请先登录论坛后再查看您的活动数据</div>
+                        </div>`;
+                    return;
+                }
 
                 this.renderer.renderActivity(this.activitySubTab);
 
